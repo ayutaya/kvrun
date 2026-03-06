@@ -1,4 +1,4 @@
-## kvrun — 汎用シェルラッパー
+## kvrun — 開発向けユーティリティ
 
 `.env` 内の `kv://vault-name/secret-name` または `kv://vault-name/secret-name#version_id` を Azure Key Vault から取得し、後続コマンドへ渡します。
 一時ファイルを作成せず、`kvrun` 自体はターミナルへ実値を出力しません。
