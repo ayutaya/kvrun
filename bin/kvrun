@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# kvrun - Azure Key Vault から環境変数を取得して後続コマンドを起動するラッパースクリプト
+#
+# 使い方:
+#   kvrun [オプション] <.env ファイルパス> <コマンド> [コマンド引数...]
+#
+# .env 内の値が kv://vault-name/secret-name（または kv://vault-name/secret-name#version_id）形式の場合、
+# az keyvault secret show で実値へ変換してから後続コマンドを exec 起動する。
+# 一時ファイルの作成やターミナルへの実値出力は一切行わない。
+#
+# オプション:
+#   -h, --help       このヘルプを表示する
+#   --no-inherit     現在の環境変数を引き継がず、.env の内容のみを後続プロセスに渡す
+#
+# セキュリティ制約（環境変数）:
+#   KVRUN_ALLOWED_VAULT_PATTERNS      許可する Vault 名パターン（カンマ区切り、例: *-dev,*-sandbox）
+#   KVRUN_ALLOWED_SUBSCRIPTION_IDS    許可する Azure Subscription ID（カンマ区切り）
+#   KVRUN_ALLOW_UNSAFE_COMMANDS       1 の場合のみ env / printenv を許可
+
+set -euo pipefail
+
+# ===========================================================================
+# 定数
+# ===========================================================================
+readonly SCRIPT_NAME="kvrun"
+readonly KV_PREFIX="kv://"
+readonly ENV_KEY_REGEX='^[A-Za-z_][A-Za-z0-9_]*$'
+readonly AZURE_VAULT_NAME_REGEX='^[A-Za-z0-9-]{3,24}$'
+readonly AZURE_SECRET_NAME_REGEX='^[A-Za-z0-9-]+$'
+readonly AZURE_SECRET_VERSION_ID_REGEX='^[A-Za-z0-9]+$'
+readonly ALLOW_UNSAFE_COMMANDS_ENV="KVRUN_ALLOW_UNSAFE_COMMANDS"
+
+# ===========================================================================
+# ヘルプ表示
+# ===========================================================================
+usage() {
+    cat >&2 <<EOF
+使い方: ${SCRIPT_NAME} [オプション] <.env ファイルパス> <コマンド> [コマンド引数...]
+
+  .env 内の値が kv://vault-name/secret-name（または kv://vault-name/secret-name#version_id）形式の場合、
+  az keyvault secret show で実値を取得し後続コマンドを exec 起動します。
+
+オプション:
+  -h, --help       このヘルプを表示する
+  --no-inherit     現在の環境変数を引き継がず、.env の内容のみを渡す
+
+セキュリティ制約（環境変数）:
+  KVRUN_ALLOWED_VAULT_PATTERNS      許可する Vault 名パターン（カンマ区切り）
+  KVRUN_ALLOWED_SUBSCRIPTION_IDS    許可する Azure Subscription ID（カンマ区切り）
+  KVRUN_ALLOW_UNSAFE_COMMANDS       1 の場合のみ env / printenv を許可
+
+.env 記述例:
+  DB_PASSWORD=kv://my-app-dev/db-password
+  APP_KEY=kv://my-app-dev/app-key#0123456789abcdef0123456789abcdef
+  LOG_LEVEL=debug
+
+使用例:
+  ${SCRIPT_NAME} .env php artisan serve
+  ${SCRIPT_NAME} --no-inherit .env npm run dev
+EOF
+}
+
+# ===========================================================================
+# エラー出力ユーティリティ（実値は表示しない）
+# ===========================================================================
+log_info() {
+    echo "[${SCRIPT_NAME}] $*" >&2
+}
+
+log_error() {
+    echo "[${SCRIPT_NAME}] エラー: $*" >&2
+}
+
+# ===========================================================================
+# 文字列ユーティリティ
+# ===========================================================================
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+split_csv_to_array() {
+    local raw="$1"
+    local -n out_ref="$2"
+    local -a csv_items=()
+    local item=""
+
+    out_ref=()
+    IFS=',' read -r -a csv_items <<< "$raw"
+    for item in "${csv_items[@]}"; do
+        item="$(trim "$item")"
+        [[ -n "$item" ]] && out_ref+=("$item")
+    done
+}
+
+# ===========================================================================
+# セキュリティ制約の読み込み
+# ===========================================================================
+declare -a allowed_vault_patterns=()
+declare -a allowed_subscription_ids=()
+
+split_csv_to_array "${KVRUN_ALLOWED_VAULT_PATTERNS:-}" allowed_vault_patterns
+for i in "${!allowed_vault_patterns[@]}"; do
+    allowed_vault_patterns[$i]="${allowed_vault_patterns[$i],,}"
+done
+
+split_csv_to_array "${KVRUN_ALLOWED_SUBSCRIPTION_IDS:-}" allowed_subscription_ids
+
+# ===========================================================================
+# Azure CLI 事前確認（必要時のみ）
+# ===========================================================================
+az_preflight_done=false
+current_subscription_id=""
+
+ensure_azure_preflight() {
+    if [[ "$az_preflight_done" == true ]]; then
+        return
+    fi
+
+    if ! command -v az &>/dev/null; then
+        log_error "Azure CLI (az) がインストールされていないか、PATH に含まれていません。"
+        log_error "インストール方法: https://learn.microsoft.com/ja-jp/cli/azure/install-azure-cli"
+        exit 1
+    fi
+
+    if ! current_subscription_id="$(az account show \
+        --query "id" \
+        --output tsv \
+        --only-show-errors \
+        </dev/null \
+        2>/dev/null)"; then
+        log_error "Azure CLI のログイン状態を確認できません。'az login' を実行してください。"
+        exit 1
+    fi
+
+    if [[ ${#allowed_subscription_ids[@]} -gt 0 ]]; then
+        local allowed_id=""
+        local matched=false
+        for allowed_id in "${allowed_subscription_ids[@]}"; do
+            if [[ "$current_subscription_id" == "$allowed_id" ]]; then
+                matched=true
+                break
+            fi
+        done
+
+        if [[ "$matched" != true ]]; then
+            log_error "現在の Azure サブスクリプションは許可されていません。"
+            log_error "KVRUN_ALLOWED_SUBSCRIPTION_IDS に開発用サブスクリプション ID を設定してください。"
+            exit 1
+        fi
+    fi
+
+    az_preflight_done=true
+}
+
+is_vault_allowed() {
+    local vault_name="$1"
+    local pattern=""
+    local normalized="${vault_name,,}"
+
+    if [[ ${#allowed_vault_patterns[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    for pattern in "${allowed_vault_patterns[@]}"; do
+        if [[ "$normalized" == $pattern ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+assert_command_is_safe() {
+    local command_name="${1##*/}"
+
+    case "$command_name" in
+        env|printenv)
+            if [[ "${KVRUN_ALLOW_UNSAFE_COMMANDS:-0}" != "1" ]]; then
+                log_error "機密情報の漏えい防止のため '${command_name}' の実行を拒否しました。"
+                log_error "必要な場合のみ ${ALLOW_UNSAFE_COMMANDS_ENV}=1 を明示して実行してください。"
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+clear_inherited_environment() {
+    local -A preserved=(
+        [PATH]=1
+        [HOME]=1
+        [TERM]=1
+        [LANG]=1
+        [LC_ALL]=1
+        [LC_CTYPE]=1
+        [LC_MESSAGES]=1
+        [PWD]=1
+        [SHLVL]=1
+        [_]=1
+    )
+    local env_name=""
+
+    while IFS= read -r env_name; do
+        if [[ -z "${preserved[$env_name]:-}" ]]; then
+            unset "$env_name" 2>/dev/null || true
+        fi
+    done < <(compgen -e)
+}
+
+# ===========================================================================
+# 引数パース
+# ===========================================================================
+no_inherit=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --no-inherit)
+            no_inherit=true
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            log_error "不明なオプション: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            # 最初の非オプション引数が .env ファイルパス
+            break
+            ;;
+    esac
+done
+
+# 引数の最低数チェック（.env パス + コマンド）
+if [[ $# -lt 2 ]]; then
+    log_error "引数が不足しています。.env ファイルパスとコマンドの両方を指定してください。"
+    usage
+    exit 1
+fi
+
+env_file="$1"
+shift
+# 残りの引数がコマンドとその引数
+command_and_args=("$@")
+assert_command_is_safe "${command_and_args[0]}"
+
+# ===========================================================================
+# .env ファイルの存在確認
+# ===========================================================================
+if [[ ! -f "$env_file" ]]; then
+    log_error ".env ファイルが見つかりません: ${env_file}"
+    exit 1
+fi
+
+# ===========================================================================
+# .env ファイルをパースして環境変数を構築する
+#
+# - コメント行（# で始まる）・空行はスキップ
+# - 非コメント行は KEY=VALUE 形式を必須とし、違反時はエラー終了
+# - VALUE が kv:// で始まる場合は Azure Key Vault から実値を取得
+# - 取得した値は連想配列に保持し、最終的に子プロセスへ渡す
+# ===========================================================================
+
+# 環境変数のキーと値を保持する配列
+declare -a env_keys=()
+declare -a env_values=()
+declare -A seen_keys=()
+
+line_number=0
+
+while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    line_number=$((line_number + 1))
+
+    # 行全体のトリムは制御用にのみ使用し、値の破壊を避けるため raw_line は保持する
+    line="$(trim "$raw_line")"
+
+    # 空行・コメント行はスキップ
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    # 非コメント行で KEY=VALUE 形式でない行はエラー
+    if [[ "$raw_line" != *"="* ]]; then
+        log_error "KEY=VALUE 形式ではない行があります（行 ${line_number}）: ${raw_line}"
+        exit 1
+    fi
+
+    # KEY と VALUE に分割（最初の = のみで分割）
+    key="${raw_line%%=*}"
+    raw_value="${raw_line#*=}"
+
+    # キーの前後空白除去・空キーはスキップ
+    key="$(trim "$key")"
+    [[ -z "$key" ]] && continue
+
+    # export プレフィックスがあれば除去
+    if [[ "$key" =~ ^export[[:space:]]+ ]]; then
+        key="${key#export}"
+        key="$(trim "$key")"
+    fi
+
+    # 値は左側空白のみ除去。右側空白は保持して意図しない値変化を防ぐ。
+    raw_value="${raw_value#"${raw_value%%[![:space:]]*}"}"
+    raw_value="${raw_value%$'\r'}"
+
+    # 全体クォートのみ外す（シングル・ダブル両対応）。
+    # 右側に空白のみあるケース（VALUE="x"   ）も許容する。
+    if [[ "$raw_value" =~ ^\"(.*)\"[[:space:]]*$ ]]; then
+        raw_value="${BASH_REMATCH[1]}"
+    elif [[ "$raw_value" =~ ^\'(.*)\'[[:space:]]*$ ]]; then
+        raw_value="${BASH_REMATCH[1]}"
+    fi
+
+    # 環境変数キー形式の検証
+    if [[ ! "$key" =~ $ENV_KEY_REGEX ]]; then
+        log_error "環境変数キー形式が不正です（行 ${line_number}）: ${key}"
+        log_error "許可形式: 英字または _ で開始し、英数字と _ のみ使用可能"
+        exit 1
+    fi
+
+    # 重複キーを拒否（意図しない上書きを防止）
+    if [[ -n "${seen_keys[$key]:-}" ]]; then
+        log_error "同じ環境変数キーが複数回定義されています（行 ${line_number}）: ${key}"
+        exit 1
+    fi
+    seen_keys["$key"]=1
+
+    # kv:// プレフィックスの検出と Key Vault 参照解決
+    if [[ "$raw_value" == "${KV_PREFIX}"* ]]; then
+        # kv://vault-name/secret-name または
+        # kv://vault-name/secret-name#version_id 形式を要求
+        if [[ ! "$raw_value" =~ ^kv://([^/]+)/([^/#]+)(#([^/#]*))?$ ]]; then
+            log_error "kv:// URI の形式が不正です（行 ${line_number}）: ${raw_value}"
+            log_error "正しい形式: kv://vault-name/secret-name または kv://vault-name/secret-name#version_id"
+            exit 1
+        fi
+        vault_name="${BASH_REMATCH[1]}"
+        secret_name="${BASH_REMATCH[2]}"
+        version_id="${BASH_REMATCH[4]:-}"
+
+        if [[ ! "$vault_name" =~ $AZURE_VAULT_NAME_REGEX ]]; then
+            log_error "Vault 名の形式が不正です（行 ${line_number}）: ${vault_name}"
+            exit 1
+        fi
+
+        if [[ ! "$secret_name" =~ $AZURE_SECRET_NAME_REGEX ]]; then
+            log_error "シークレット名の形式が不正です（行 ${line_number}）: ${secret_name}"
+            exit 1
+        fi
+
+        if [[ "$raw_value" == *"#"* ]]; then
+            if [[ -z "$version_id" || ! "$version_id" =~ $AZURE_SECRET_VERSION_ID_REGEX ]]; then
+                log_error "バージョン ID の形式が不正です（行 ${line_number}）: ${version_id}"
+                log_error "許可形式: 英数字のみ"
+                exit 1
+            fi
+        fi
+
+        if ! is_vault_allowed "$vault_name"; then
+            log_error "許可されていない Vault 名です（行 ${line_number}）: ${vault_name}"
+            log_error "KVRUN_ALLOWED_VAULT_PATTERNS で開発用 Vault のみ許可してください。"
+            exit 1
+        fi
+
+        ensure_azure_preflight
+        log_info "${key} を Key Vault から取得中: vault=${vault_name}"
+
+        # az keyvault secret show で実値を取得（stderr は捨て、失敗時はエラー終了）
+        # --query value -o tsv で値のみを取り出す
+        resolved_value=""
+        az_command=(az keyvault secret show --vault-name "$vault_name" --name "$secret_name")
+        if [[ -n "$version_id" ]]; then
+            az_command+=(--version "$version_id")
+        fi
+        az_command+=(--query "value" --output tsv --only-show-errors)
+
+        # </dev/null で az の stdin を切り離す。
+        # while ループが .env ファイルを fd0 で読んでいる最中に
+        # az が同じ fd0 を消費して残行を読み飛ばすのを防ぐため必須。
+        if ! resolved_value=$("${az_command[@]}" \
+            </dev/null \
+            2>/dev/null); then
+            # az コマンドが失敗した場合も、詳細エラーを表示しない（秘匿情報保護）
+            log_error "${key} の取得に失敗しました。アクセス権限・Vault 名・シークレット名・バージョン ID を確認してください。"
+            exit 1
+        fi
+
+        env_keys+=("$key")
+        env_values+=("$resolved_value")
+    else
+        # kv:// でない通常値はそのまま保持
+        env_keys+=("$key")
+        env_values+=("$raw_value")
+    fi
+
+done < "$env_file"
+
+# ===========================================================================
+# exec で後続コマンドを起動
+#
+# --no-inherit の場合は基本的な環境変数のみ残して現在環境を削減。
+# 通常は現在の環境変数を引き継ぎ、.env の値を export して上書きする。
+#
+# exec により kvrun プロセス自体は終了し、後続コマンドがその PID を引き継ぐ。
+# これにより、このスクリプトのプロセスがメモリ上に残り続けることを防ぐ。
+# ===========================================================================
+
+if [[ "$no_inherit" == true ]]; then
+    # 現在の環境変数を極力排除してから .env の値のみを残す。
+    # KEY=VALUE を引数として渡さず、プロセス引数経由の漏えいリスクを抑える。
+    clear_inherited_environment
+fi
+
+# .env から解決した値を export し、後続コマンドを exec 起動
+for i in "${!env_keys[@]}"; do
+    export "${env_keys[$i]}=${env_values[$i]}"
+done
+
+exec "${command_and_args[@]}"
