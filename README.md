@@ -6,8 +6,10 @@
 1Password CLI ライクな記法で、.envにAzure Key Vaultから値を差し込みたくて作りました。
 
 ### 依存
-Bash 4.3+
-Azure CLIが動作する環境
+- Bash 4.3+
+- Azure CLIが動作する環境
+- `az login` でログイン済みであること
+- 対象 Key Vault のシークレット読み取り権限（`Key Vault Secrets User` ロール等）があること
 
 ### 使い方
 
@@ -77,10 +79,32 @@ export KEY=実値 ... してから exec php artisan serve
   ↑ kvrun プロセスは置き換えられて終了。後続プロセスがその PID を引き継ぐ。
 ```
 
-### 前提
+## このツールの位置づけ
 
-- `az login` でログイン済みであること
-- 対象 Key Vault のシークレット読み取り権限（`Key Vault Secrets User` ロール等）があること
+### 何を解決するツールか
+
+`kvrun` は、主に次のような問題に対して有効です。
+
+- `.env` に平文 secret を置きたくない
+- 開発者ごとに secret を配りたくない
+- Azure Key Vault の secret をローカル開発時だけ使いたい
+- Laravel アプリ本体に Azure SDK や Key Vault Provider を入れたくない
+- AI ツールやコード検索に見えやすい場所から credential を外したい
+
+### 何を解決しないか
+
+`kvrun` は、次の問題を解決しません。
+
+- 起動後のプロセスからの secret 漏えい
+- アプリケーションコードやデバッグコードによる secret 出力
+- 標準出力・標準エラー・ログ収集基盤への漏えい
+- 本番相当の外部参照データや readonly 接続のリスク
+- SSO セッションやマウント済み credential の露出
+- 過剰権限な開発環境そのもの
+- AI に実行ログ全文を返す設計
+- 組織全体のクラウド権限設計の不備
+
+`kvrun` は、**安全な環境を作るツールではなく、避けられる露出を一つ減らすツール**です。
 
 ### セキュリティ仕様（kvrun）
 
