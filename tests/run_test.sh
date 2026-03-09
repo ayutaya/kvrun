@@ -371,9 +371,74 @@ fi
 rm -f "$TMPENV"
 
 # ---------------------------------------------------------------------------
-# テスト 16: install.sh のヘルプ表示
+# テスト 16: az の CRLF 出力でも末尾 \r を除去
 # ---------------------------------------------------------------------------
-section "16. install.sh のヘルプ表示"
+section "16. az の CRLF 出力でも末尾 \\r を除去"
+TMPENV="$(mktemp)"
+FAKE_AZ_DIR="$(mktemp -d)"
+printf 'TEST_SECRET=kv://my-app-dev/test-secret\n' > "$TMPENV"
+cat > "${FAKE_AZ_DIR}/az.cmd" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  echo "00000000-0000-0000-0000-000000000000"
+  exit 0
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "secret" && "$3" == "show" ]]; then
+  printf 'resolved-value\r\n'
+  exit 0
+fi
+
+echo "unexpected az args" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az.cmd"
+ln -s "${FAKE_AZ_DIR}/az.cmd" "${FAKE_AZ_DIR}/az"
+OUTPUT="$(PATH="${FAKE_AZ_DIR}:$PATH" KVRUN_ALLOW_UNSAFE_COMMANDS=1 bash "$BIN" --no-inherit "$TMPENV" bash -c 'printf "%q" "$TEST_SECRET"' 2>/dev/null)" || true
+if [[ "$OUTPUT" == "resolved-value" ]]; then
+    pass "CRLF 出力でも末尾 \\r を除去して後続プロセスへ渡せた"
+else
+    fail "CRLF 出力の末尾 \\r が除去されていない（出力: ${OUTPUT})"
+fi
+rm -rf "$FAKE_AZ_DIR"
+rm -f "$TMPENV"
+
+# ---------------------------------------------------------------------------
+# テスト 17: Linux/macOS 版 az は末尾 \r を温存
+# ---------------------------------------------------------------------------
+section "17. Linux/macOS 版 az は末尾 \\r を温存"
+TMPENV="$(mktemp)"
+FAKE_AZ_DIR="$(mktemp -d)"
+printf 'TEST_SECRET=kv://my-app-dev/test-secret\n' > "$TMPENV"
+cat > "${FAKE_AZ_DIR}/az" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  echo "00000000-0000-0000-0000-000000000000"
+  exit 0
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "secret" && "$3" == "show" ]]; then
+  printf 'resolved-value\r\n'
+  exit 0
+fi
+
+echo "unexpected az args" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az"
+OUTPUT="$(PATH="${FAKE_AZ_DIR}:$PATH" KVRUN_ALLOW_UNSAFE_COMMANDS=1 bash "$BIN" --no-inherit "$TMPENV" bash -c 'printf "%q" "$TEST_SECRET"' 2>/dev/null)" || true
+if [[ "$OUTPUT" == "\$'resolved-value\\r'" ]]; then
+    pass "Windows 系でない az パスでは値を変更しない"
+else
+    fail "Windows 系でない az パスでも値が変更された（出力: ${OUTPUT})"
+fi
+rm -rf "$FAKE_AZ_DIR"
+rm -f "$TMPENV"
+
+# ---------------------------------------------------------------------------
+# テスト 18: install.sh のヘルプ表示
+# ---------------------------------------------------------------------------
+section "18. install.sh のヘルプ表示"
 OUTPUT="$(bash "$INSTALL_SCRIPT" --help 2>&1)" || true
 if echo "$OUTPUT" | grep -q "使い方"; then
     pass "install.sh --help が正常に表示された"
@@ -382,9 +447,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# テスト 17: install.sh でユーザー領域へインストールできる
+# テスト 19: install.sh でユーザー領域へインストールできる
 # ---------------------------------------------------------------------------
-section "17. install.sh でユーザー領域へインストールできる"
+section "19. install.sh でユーザー領域へインストールできる"
 TMP_HOME="$(mktemp -d)"
 OUTPUT="$(HOME="$TMP_HOME" PATH="/usr/bin:/bin" bash "$INSTALL_SCRIPT" 2>&1)" || true
 INSTALLED_BIN="${TMP_HOME}/.local/bin/kvrun"
@@ -407,9 +472,9 @@ fi
 rm -rf "$TMP_HOME"
 
 # ---------------------------------------------------------------------------
-# テスト 18: install.sh は古い Bash 指定を拒否
+# テスト 20: install.sh は古い Bash 指定を拒否
 # ---------------------------------------------------------------------------
-section "18. install.sh は古い Bash 指定を拒否"
+section "20. install.sh は古い Bash 指定を拒否"
 TMP_INSTALL_DIR="$(mktemp -d)"
 FAKE_OLD_BASH_DIR="$(mktemp -d)"
 FAKE_OLD_BASH="${FAKE_OLD_BASH_DIR}/bash"
@@ -431,9 +496,9 @@ fi
 rm -rf "$TMP_INSTALL_DIR" "$FAKE_OLD_BASH_DIR"
 
 # ---------------------------------------------------------------------------
-# テスト 19: install.sh は既存の無関係なファイルを保護する
+# テスト 21: install.sh は既存の無関係なファイルを保護する
 # ---------------------------------------------------------------------------
-section "19. install.sh は既存の無関係なファイルを保護する"
+section "21. install.sh は既存の無関係なファイルを保護する"
 TMP_INSTALL_DIR="$(mktemp -d)"
 printf '#!/usr/bin/env bash\necho unrelated\n' > "${TMP_INSTALL_DIR}/kvrun"
 chmod +x "${TMP_INSTALL_DIR}/kvrun"
@@ -446,9 +511,9 @@ fi
 rm -rf "$TMP_INSTALL_DIR"
 
 # ---------------------------------------------------------------------------
-# テスト 20: kvrun のバージョン表示
+# テスト 22: kvrun のバージョン表示
 # ---------------------------------------------------------------------------
-section "20. kvrun のバージョン表示"
+section "22. kvrun のバージョン表示"
 OUTPUT="$(bash "$BIN" --version 2>&1)" || true
 if [[ "$OUTPUT" == "kvrun 0.1.0" ]]; then
     pass "--version で期待したバージョンを表示できた"

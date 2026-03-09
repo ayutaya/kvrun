@@ -153,16 +153,73 @@ split_csv_to_array "${KVRUN_ALLOWED_SUBSCRIPTION_IDS:-}" allowed_subscription_id
 # ===========================================================================
 az_preflight_done=false
 current_subscription_id=""
+az_command_path=""
+az_output_may_have_crlf=false
+
+resolve_command_path() {
+    local path="$1"
+    local dir=""
+    local target=""
+
+    if [[ -z "$path" ]]; then
+        return
+    fi
+
+    if [[ "$path" != /* ]]; then
+        dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || {
+            printf '%s' "$path"
+            return
+        }
+        path="${dir}/$(basename "$path")"
+    fi
+
+    while [[ -L "$path" ]]; do
+        dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || break
+        target="$(readlink "$path" 2>/dev/null || true)"
+        [[ -z "$target" ]] && break
+
+        if [[ "$target" == /* ]]; then
+            path="$target"
+        else
+            path="${dir}/${target}"
+        fi
+    done
+
+    dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || {
+        printf '%s' "$path"
+        return
+    }
+    printf '%s/%s' "$dir" "$(basename "$path")"
+}
+
+command_output_may_include_crlf() {
+    local path="$1"
+
+    case "$path" in
+        *.exe|*.cmd|*.bat|*.ps1|/mnt/[A-Za-z]/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 ensure_azure_preflight() {
     if [[ "$az_preflight_done" == true ]]; then
         return
     fi
 
-    if ! command -v az &>/dev/null; then
+    if ! az_command_path="$(type -P az)"; then
         log_error "Azure CLI (az) がインストールされていないか、PATH に含まれていません。"
         log_error "インストール方法: https://learn.microsoft.com/ja-jp/cli/azure/install-azure-cli"
         exit 1
+    fi
+
+    if command_output_may_include_crlf "$(resolve_command_path "$az_command_path")"; then
+        az_output_may_have_crlf=true
+    else
+        az_output_may_have_crlf=false
     fi
 
     if ! current_subscription_id="$(az account show \
@@ -434,6 +491,11 @@ while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
             # az コマンドが失敗した場合も、詳細エラーを表示しない（秘匿情報保護）
             log_error "${key} の取得に失敗しました。アクセス権限・Vault 名・シークレット名・バージョン ID を確認してください。"
             exit 1
+        fi
+        # WSL から Windows 版 az を呼ぶと末尾改行が CRLF になることがある。
+        # その場合だけ、コマンド置換後に残る \r を除去する。
+        if [[ "$az_output_may_have_crlf" == true ]]; then
+            resolved_value="${resolved_value%$'\r'}"
         fi
 
         env_keys+=("$key")
