@@ -10,6 +10,7 @@
 #
 # オプション:
 #   -h, --help       このヘルプを表示する
+#   -v, --version    バージョンを表示する
 #   --no-inherit     現在の環境変数を引き継がず、.env の内容のみを後続プロセスに渡す
 #
 # セキュリティ制約（環境変数）:
@@ -29,6 +30,9 @@ readonly AZURE_VAULT_NAME_REGEX='^[A-Za-z0-9-]{3,24}$'
 readonly AZURE_SECRET_NAME_REGEX='^[A-Za-z0-9-]+$'
 readonly AZURE_SECRET_VERSION_ID_REGEX='^[A-Za-z0-9]+$'
 readonly ALLOW_UNSAFE_COMMANDS_ENV="KVRUN_ALLOW_UNSAFE_COMMANDS"
+readonly MIN_BASH_MAJOR=4
+readonly MIN_BASH_MINOR=3
+readonly KVRUN_VERSION="0.1.0"
 
 # ===========================================================================
 # ヘルプ表示
@@ -42,7 +46,12 @@ usage() {
 
 オプション:
   -h, --help       このヘルプを表示する
+  -v, --version    バージョンを表示する
   --no-inherit     現在の環境変数を引き継がず、.env の内容のみを渡す
+
+前提:
+  Bash ${MIN_BASH_MAJOR}.${MIN_BASH_MINOR} 以上
+  Azure CLI (az) が利用可能であること
 
 セキュリティ制約（環境変数）:
   KVRUN_ALLOWED_VAULT_PATTERNS      許可する Vault 名パターン（カンマ区切り）
@@ -70,6 +79,37 @@ log_info() {
 log_error() {
     echo "[${SCRIPT_NAME}] エラー: $*" >&2
 }
+
+print_version() {
+    echo "${SCRIPT_NAME} ${KVRUN_VERSION}"
+}
+
+require_supported_bash() {
+    local current_major="${BASH_VERSINFO[0]:-0}"
+    local current_minor="${BASH_VERSINFO[1]:-0}"
+    local os_name=""
+
+    if (( current_major > MIN_BASH_MAJOR )); then
+        return
+    fi
+
+    if (( current_major == MIN_BASH_MAJOR && current_minor >= MIN_BASH_MINOR )); then
+        return
+    fi
+
+    log_error "Bash ${MIN_BASH_MAJOR}.${MIN_BASH_MINOR} 以上が必要です。現在の Bash バージョン: ${current_major}.${current_minor}"
+
+    os_name="$(uname -s 2>/dev/null || true)"
+    if [[ "$os_name" == "Darwin" ]]; then
+        log_error "macOS では Homebrew などで Bash 4.3 以上を導入し、その Bash で kvrun を実行してください。"
+    else
+        log_error "Bash 4.3 以上をインストールしてから再実行してください。"
+    fi
+
+    exit 1
+}
+
+require_supported_bash
 
 # ===========================================================================
 # 文字列ユーティリティ
@@ -218,6 +258,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
             usage
+            exit 0
+            ;;
+        -v|--version)
+            print_version
             exit 0
             ;;
         --no-inherit)

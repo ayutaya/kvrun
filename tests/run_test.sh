@@ -18,11 +18,13 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BIN="${REPO_ROOT}/bin/kvrun"
+INSTALL_SCRIPT="${REPO_ROOT}/install.sh"
 ENV_FILE="${SCRIPT_DIR}/.env.test"
 KEYVAULT_NAME="${KEYVAULT_NAME:-}"
 KEYVAULT_DB_PASSWORD_SECRET_NAME="${KEYVAULT_DB_PASSWORD_SECRET_NAME:-db-password}"
 KEYVAULT_TEST_SECRET_NAME="${KEYVAULT_TEST_SECRET_NAME:-test-secret}"
 KEYVAULT_DB_PASSWORD_VERSION="${KEYVAULT_DB_PASSWORD_VERSION:-}"
+SYSTEM_PATH="${PATH:-/usr/bin:/bin}"
 
 # ---------------------------------------------------------------------------
 # ユーティリティ
@@ -275,6 +277,10 @@ else
     echo "  .env.test: ${ENV_FILE}"
     OUTPUT="$(KVRUN_ALLOW_UNSAFE_COMMANDS=1 bash "$BIN" --no-inherit "$ENV_FILE" env 2>/dev/null)" || true
 
+    # テストのために出力全体を表示（実際の値は伏せるべきだが、テスト環境なので許容）
+    echo "  OUTPUT:"
+    echo "$OUTPUT"
+
     if echo "$OUTPUT" | grep -q "^DB_PASSWORD="; then
         RESOLVED_VAL="$(echo "$OUTPUT" | grep '^DB_PASSWORD=' | cut -d= -f2-)"
         if [[ "$RESOLVED_VAL" != "kv://"* && -n "$RESOLVED_VAL" ]]; then
@@ -294,7 +300,7 @@ else
             fail "DB_PASSWORD_VERSION が kv:// のまま（解決されていない）: ${RESOLVED_VAL}"
         fi
     else
-        fail "DB_PASSWORD_VERSION が出力に含まれていない（Key Vault 取得エラーの可能性）"
+        fail "DB_PASSWORD_VERSION が出力に含まれていない（Key Vault 取得エラーの可能性：vault名や参照権限の設定を確認してください）"
     fi
 
     if echo "$OUTPUT" | grep -q "^TEST_SECRET="; then
@@ -305,7 +311,7 @@ else
             fail "TEST_SECRET が kv:// のまま（解決されていない）: ${RESOLVED_VAL}"
         fi
     else
-        fail "TEST_SECRET が出力に含まれていない（Key Vault 取得エラーの可能性）"
+        fail "TEST_SECRET が出力に含まれていない（Key Vault 取得エラーの可能性：vault名や参照権限の設定を確認してください）"
     fi
 
     if echo "$OUTPUT" | grep -q "^PLAIN_VAR=hello"; then
@@ -363,6 +369,99 @@ else
     fail "末尾空白が保持されていない（出力: ${OUTPUT})"
 fi
 rm -f "$TMPENV"
+
+# ---------------------------------------------------------------------------
+# テスト 16: install.sh のヘルプ表示
+# ---------------------------------------------------------------------------
+section "16. install.sh のヘルプ表示"
+OUTPUT="$(bash "$INSTALL_SCRIPT" --help 2>&1)" || true
+if echo "$OUTPUT" | grep -q "使い方"; then
+    pass "install.sh --help が正常に表示された"
+else
+    fail "install.sh --help の出力に '使い方' が含まれていない"
+fi
+
+# ---------------------------------------------------------------------------
+# テスト 17: install.sh でユーザー領域へインストールできる
+# ---------------------------------------------------------------------------
+section "17. install.sh でユーザー領域へインストールできる"
+TMP_HOME="$(mktemp -d)"
+OUTPUT="$(HOME="$TMP_HOME" PATH="/usr/bin:/bin" bash "$INSTALL_SCRIPT" 2>&1)" || true
+INSTALLED_BIN="${TMP_HOME}/.local/bin/kvrun"
+if [[ ! -f "$INSTALLED_BIN" ]]; then
+    fail "install.sh 実行後も kvrun が配置されていない（出力: ${OUTPUT})"
+elif ! head -n 1 "$INSTALLED_BIN" | grep -Eq '^#!/.*/bash$'; then
+    fail "インストール後の shebang が Bash の絶対パスになっていない"
+elif head -n 1 "$INSTALLED_BIN" | grep -q '^#!/usr/bin/env bash$'; then
+    fail "インストール後も env bash のままになっている"
+elif ! echo "$OUTPUT" | grep -q "PATH に"; then
+    fail "PATH 未設定時の案内が表示されていない（出力: ${OUTPUT})"
+else
+    RUN_OUTPUT="$(HOME="$TMP_HOME" PATH="${TMP_HOME}/.local/bin:${SYSTEM_PATH}" kvrun --help 2>&1)" || true
+    if echo "$RUN_OUTPUT" | grep -q "Bash 4.3 以上"; then
+        pass "install.sh で配置した kvrun を PATH 経由で実行できた"
+    else
+        fail "インストール後の kvrun 実行に失敗した（出力: ${RUN_OUTPUT})"
+    fi
+fi
+rm -rf "$TMP_HOME"
+
+# ---------------------------------------------------------------------------
+# テスト 18: install.sh は古い Bash 指定を拒否
+# ---------------------------------------------------------------------------
+section "18. install.sh は古い Bash 指定を拒否"
+TMP_INSTALL_DIR="$(mktemp -d)"
+FAKE_OLD_BASH_DIR="$(mktemp -d)"
+FAKE_OLD_BASH="${FAKE_OLD_BASH_DIR}/bash"
+cat > "$FAKE_OLD_BASH" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "-lc" ]]; then
+  echo "3.2"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_OLD_BASH"
+OUTPUT="$(bash "$INSTALL_SCRIPT" --install-dir "$TMP_INSTALL_DIR" --bash-path "$FAKE_OLD_BASH" 2>&1)" || true
+if echo "$OUTPUT" | grep -q "4.3 以上ではありません"; then
+    pass "古い Bash を明示指定した場合に拒否できた"
+else
+    fail "古い Bash の拒否に失敗した（出力: ${OUTPUT})"
+fi
+rm -rf "$TMP_INSTALL_DIR" "$FAKE_OLD_BASH_DIR"
+
+# ---------------------------------------------------------------------------
+# テスト 19: install.sh は既存の無関係なファイルを保護する
+# ---------------------------------------------------------------------------
+section "19. install.sh は既存の無関係なファイルを保護する"
+TMP_INSTALL_DIR="$(mktemp -d)"
+printf '#!/usr/bin/env bash\necho unrelated\n' > "${TMP_INSTALL_DIR}/kvrun"
+chmod +x "${TMP_INSTALL_DIR}/kvrun"
+OUTPUT="$(bash "$INSTALL_SCRIPT" --install-dir "$TMP_INSTALL_DIR" 2>&1)" || true
+if echo "$OUTPUT" | grep -q "既存ファイルを保護"; then
+    pass "無関係な既存ファイルを上書きせず保護できた"
+else
+    fail "既存ファイル保護に失敗した（出力: ${OUTPUT})"
+fi
+rm -rf "$TMP_INSTALL_DIR"
+
+# ---------------------------------------------------------------------------
+# テスト 20: kvrun のバージョン表示
+# ---------------------------------------------------------------------------
+section "20. kvrun のバージョン表示"
+OUTPUT="$(bash "$BIN" --version 2>&1)" || true
+if [[ "$OUTPUT" == "kvrun 0.1.0" ]]; then
+    pass "--version で期待したバージョンを表示できた"
+else
+    fail "--version の出力が想定外（出力: ${OUTPUT})"
+fi
+
+OUTPUT="$(bash "$BIN" -v 2>&1)" || true
+if [[ "$OUTPUT" == "kvrun 0.1.0" ]]; then
+    pass "-v でも期待したバージョンを表示できた"
+else
+    fail "-v の出力が想定外（出力: ${OUTPUT})"
+fi
 
 # ---------------------------------------------------------------------------
 # テスト結果サマリー

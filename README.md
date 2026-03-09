@@ -3,6 +3,43 @@
 `.env` 内の `kv://vault-name/secret-name` または `kv://vault-name/secret-name#version_id` を Azure Key Vault から取得し、後続コマンドへ渡します。
 一時ファイルを作成せず、`kvrun` 自体はターミナルへ実値を出力しません。
 
+対応対象は WSL2(Ubuntu) と macOS です。`kvrun` 本体の実行には Bash 4.3 以上が必要です。
+
+### インストール
+
+既定では `sudo` を使わず、ユーザー領域の `~/.local/bin` へインストールします。
+
+```bash
+bash install.sh
+```
+
+別のディレクトリへ入れる場合:
+
+```bash
+bash install.sh --install-dir "$HOME/bin"
+```
+
+#### WSL2 (Ubuntu)
+
+- 通常はシステムの Bash が 4.3 以上で、そのままインストールできます
+- `~/.local/bin` が `PATH` に入っていない場合は `~/.bashrc` などへ追加してください
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+#### macOS
+
+- macOS 標準の `/bin/bash` は 3.2 系のことが多く、そのままでは `kvrun` を実行できません
+- 先に Bash 4.3 以上を導入してください
+
+```bash
+brew install bash
+bash install.sh
+```
+
+`install.sh` は見つけた Bash 4.3+ の絶対パスを `kvrun` に埋め込むため、実行時に古い `/bin/bash` を誤って使いにくくなります。
+
 1Password CLI ライクな記法で、.envにAzure Key Vaultから値を差し込みたくて作りました。
 
 ### 依存
@@ -14,7 +51,7 @@
 ### 使い方
 
 ```bash
-bin/kvrun <.env ファイルパス> <コマンド> [引数...]
+kvrun <.env ファイルパス> <コマンド> [引数...]
 ```
 
 **オプション:**
@@ -22,8 +59,15 @@ bin/kvrun <.env ファイルパス> <コマンド> [引数...]
 | オプション | 説明 |
 |-----------|------|
 | `-h`, `--help` | ヘルプを表示 |
+| `-v`, `--version` | バージョンを表示 |
 | `--no-inherit` | 現在の環境変数を引き継がず `.env` の内容のみを渡す |
 | `--` | オプション解析を終了 |
+
+**前提:**
+
+- Bash 4.3 以上
+- `az login` でログイン済みであること
+- 対象 Key Vault のシークレット読み取り権限（`Key Vault Secrets User` ロール等）があること
 
 **セキュリティ制約（環境変数）:**
 
@@ -52,23 +96,26 @@ LOG_LEVEL=debug
 
 ```bash
 # PHP Artisan を Key Vault の環境変数つきで起動
-bin/kvrun .env php artisan serve
+kvrun .env php artisan serve
+
+# バージョン確認
+kvrun --version
 
 # Node.js 開発サーバーを起動
-bin/kvrun .env npm run dev
+kvrun .env npm run dev
 
 # 現在の環境変数を引き継がずに起動（デバッグ時のみ明示許可）
-KVRUN_ALLOW_UNSAFE_COMMANDS=1 bin/kvrun --no-inherit .env env
+KVRUN_ALLOW_UNSAFE_COMMANDS=1 kvrun --no-inherit .env env
 
 # 開発用 Vault / Subscription のみ許可して起動（推奨）
 KVRUN_ALLOWED_VAULT_PATTERNS='*-dev,*-sandbox' \
 KVRUN_ALLOWED_SUBSCRIPTION_IDS='00000000-0000-0000-0000-000000000000' \
-bin/kvrun --no-inherit .env php artisan serve
+kvrun --no-inherit .env php artisan serve
 ```
 
 ### 仕組み
 
-```
+```text
 kvrun .env php artisan serve
      ↓
 .env を1行ずつ読み込み:
@@ -79,6 +126,11 @@ export KEY=実値 ... してから exec php artisan serve
   ↑ kvrun プロセスは置き換えられて終了。後続プロセスがその PID を引き継ぐ。
 ```
 
+### アンインストール
+
+```bash
+rm -f "$HOME/.local/bin/kvrun"
+```
 ## このツールの位置づけ
 
 ### 何を解決するツールか
