@@ -3,7 +3,11 @@
 `.env` 内の `kv://vault-name/secret-name` または `kv://vault-name/secret-name#version_id` を Azure Key Vault から取得し、後続コマンドへ渡します。
 一時ファイルを作成せず、`kvrun` 自体はターミナルへ実値を出力しません。
 
-対応対象は WSL2(Ubuntu) と macOS です。`kvrun` 本体の実行には Bash 4.3 以上が必要です。
+1Password CLI ライクな記法で、.envにAzure Key Vaultから値を差し込みたくて作りました。
+
+### 動作対象
+
+ WSL2(Ubuntu) と macOS です。`kvrun` 本体の実行には Bash 4.3 以上が必要です。
 
 ### インストール
 
@@ -40,8 +44,6 @@ bash install.sh
 
 `install.sh` は見つけた Bash 4.3+ の絶対パスを `kvrun` に埋め込むため、実行時に古い `/bin/bash` を誤って使いにくくなります。
 
-1Password CLI ライクな記法で、.envにAzure Key Vaultから値を差し込みたくて作りました。
-
 ### 依存
 - Bash 4.3+
 - Azure CLIが動作する環境
@@ -62,12 +64,6 @@ kvrun <.env ファイルパス> <コマンド> [引数...]
 | `-v`, `--version` | バージョンを表示 |
 | `--no-inherit` | 現在の環境変数を引き継がず `.env` の内容のみを渡す |
 | `--` | オプション解析を終了 |
-
-**前提:**
-
-- Bash 4.3 以上
-- `az login` でログイン済みであること
-- 対象 Key Vault のシークレット読み取り権限（`Key Vault Secrets User` ロール等）があること
 
 **セキュリティ制約（環境変数）:**
 
