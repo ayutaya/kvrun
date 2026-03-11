@@ -220,6 +220,18 @@ export KEY=実値 ... してから exec php artisan serve
 ```bash
 rm -f "$HOME/.local/bin/kvrun"
 ```
+
+### リリース運用
+
+Git タグを手動で先に作成してから `VERSION` を更新すると、タグ先コミット内の `VERSION` が古いまま残ります。  
+そのため、このリポジトリでは GitHub Actions の `release` workflow からリリースする運用を推奨します。
+
+1. GitHub Actions の `release` workflow を開く
+2. `version` に `0.2.1` または `v0.2.1` を入力して実行する
+3. workflow が `VERSION` を更新し、必要ならコミットした上で `v0.2.1` タグを作成する
+
+なお、手動で `v*` タグを push した場合も `verify-tag-version` workflow が動き、タグ名と `VERSION` の不一致を検出します。
+
 ## このツールの位置づけ
 
 ### 何を解決するツールか

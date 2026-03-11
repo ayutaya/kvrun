@@ -1,0 +1,32 @@
+name: verify-tag-version
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: タグと VERSION の整合性確認
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ソースコードを取得
+        uses: actions/checkout@v6
+
+      - name: タグ名と VERSION を比較
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_name="${GITHUB_REF_NAME}"
+          expected_version="${tag_name#v}"
+          file_version="$(tr -d '\r\n' < VERSION)"
+
+          if [[ "$file_version" != "$expected_version" ]]; then
+            echo "タグ ${tag_name} と VERSION の値 ${file_version} が一致しません。" >&2
+            exit 1
+          fi
