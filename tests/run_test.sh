@@ -938,6 +938,72 @@ fi
 rm -rf "${FAKE_AZ_DIR}"
 
 # ---------------------------------------------------------------------------
+# テスト 31: 通常ログでは Key 名と Vault 名を表示しない
+# ---------------------------------------------------------------------------
+section "31. 通常ログでは Key 名と Vault 名を表示しない"
+TMPENV="$(mktemp)"
+FAKE_AZ_DIR="$(mktemp -d)"
+printf 'DB_PASSWORD=kv://my-app-dev/db-password\nAPP_KEY=kv://my-app-dev/app-key\n' > "$TMPENV"
+cat > "${FAKE_AZ_DIR}/az" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  echo "00000000-0000-0000-0000-000000000000"
+  exit 0
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "secret" && "$3" == "show" ]]; then
+  echo "resolved-value"
+  exit 0
+fi
+
+echo "unexpected az args" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az"
+OUTPUT="$(PATH="${FAKE_AZ_DIR}:${SYSTEM_PATH}" KVRUN_ALLOW_UNSAFE_COMMANDS=1 bash "$BIN" --no-inherit "$TMPENV" true 2>&1)" || true
+if echo "$OUTPUT" | grep -q "DB_PASSWORD\|APP_KEY\|my-app-dev"; then
+    fail "通常ログに Key 名または Vault 名が出力されている（出力: ${OUTPUT})"
+elif [[ "$(echo "$OUTPUT" | grep -c "Azure Key Vault からシークレットを取得しています")" -ne 1 ]]; then
+    fail "通常ログの案内が想定外（出力: ${OUTPUT})"
+else
+    pass "通常ログでは識別子を伏せたまま取得状況を案内できた"
+fi
+rm -rf "${FAKE_AZ_DIR}"
+rm -f "$TMPENV"
+
+# ---------------------------------------------------------------------------
+# テスト 32: --verbose では Key 名と Vault 名を表示する
+# ---------------------------------------------------------------------------
+section "32. --verbose では Key 名と Vault 名を表示する"
+TMPENV="$(mktemp)"
+FAKE_AZ_DIR="$(mktemp -d)"
+printf 'DB_PASSWORD=kv://my-app-dev/db-password#abc123\n' > "$TMPENV"
+cat > "${FAKE_AZ_DIR}/az" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  echo "00000000-0000-0000-0000-000000000000"
+  exit 0
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "secret" && "$3" == "show" ]]; then
+  echo "resolved-value"
+  exit 0
+fi
+
+echo "unexpected az args" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az"
+OUTPUT="$(PATH="${FAKE_AZ_DIR}:${SYSTEM_PATH}" KVRUN_ALLOW_UNSAFE_COMMANDS=1 bash "$BIN" --verbose --no-inherit "$TMPENV" true 2>&1)" || true
+if ! echo "$OUTPUT" | grep -q "key=DB_PASSWORD, vault=my-app-dev, secret=db-password, version=abc123"; then
+    fail "--verbose の詳細ログが想定外（出力: ${OUTPUT})"
+else
+    pass "--verbose 時のみ Key 名と Vault 名を表示できた"
+fi
+rm -rf "${FAKE_AZ_DIR}"
+rm -f "$TMPENV"
+
+# ---------------------------------------------------------------------------
 # テスト結果サマリー
 # ---------------------------------------------------------------------------
 echo

@@ -11,6 +11,7 @@
 # オプション:
 #   -h, --help       このヘルプを表示する
 #   -v, --version    バージョンを表示する
+#   --verbose        Key Vault 参照の詳細ログを表示する
 #   --no-inherit     現在の環境変数を引き継がず、.env の内容のみを後続プロセスに渡す
 #
 # セキュリティ制約（環境変数）:
@@ -81,6 +82,7 @@ usage() {
 オプション:
   -h, --help       このヘルプを表示する
   -v, --version    バージョンを表示する
+  --verbose        Key Vault 参照の詳細ログを表示する
   --no-inherit     現在の環境変数を引き継がず、.env の内容のみを渡す
 
 前提:
@@ -110,8 +112,50 @@ log_info() {
     echo "[${SCRIPT_NAME}] $*" >&2
 }
 
+log_verbose() {
+    [[ "${verbose:-false}" == true ]] || return 0
+    log_info "$@"
+}
+
 log_error() {
     echo "[${SCRIPT_NAME}] エラー: $*" >&2
+}
+
+log_kv_fetch_start() {
+    local key="$1"
+    local vault_name="$2"
+    local secret_name="$3"
+    local version_id="${4:-}"
+
+    if [[ "${verbose:-false}" == true ]]; then
+        if [[ -n "$version_id" ]]; then
+            log_verbose "Key Vault から取得中: key=${key}, vault=${vault_name}, secret=${secret_name}, version=${version_id}"
+        else
+            log_verbose "Key Vault から取得中: key=${key}, vault=${vault_name}, secret=${secret_name}"
+        fi
+        return
+    fi
+
+    if [[ "${kv_fetch_notice_logged:-false}" != true ]]; then
+        log_info "Azure Key Vault からシークレットを取得しています。詳細は --verbose で表示できます。"
+        kv_fetch_notice_logged=true
+    fi
+}
+
+log_kv_fetch_failure() {
+    local key="$1"
+    local vault_name="$2"
+    local secret_name="$3"
+    local version_id="${4:-}"
+
+    log_error "Key Vault からのシークレット取得に失敗しました。アクセス権限や参照設定を確認してください。"
+    if [[ "${verbose:-false}" == true ]]; then
+        if [[ -n "$version_id" ]]; then
+            log_error "取得対象: key=${key}, vault=${vault_name}, secret=${secret_name}, version=${version_id}"
+        else
+            log_error "取得対象: key=${key}, vault=${vault_name}, secret=${secret_name}"
+        fi
+    fi
 }
 
 print_version() {
@@ -179,6 +223,7 @@ az_preflight_done=false
 current_subscription_id=""
 az_command_path=""
 az_output_may_have_crlf=false
+kv_fetch_notice_logged=false
 
 resolve_command_path() {
     local path="$1"
@@ -334,6 +379,7 @@ clear_inherited_environment() {
 # 引数パース
 # ===========================================================================
 no_inherit=false
+verbose=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -344,6 +390,10 @@ while [[ $# -gt 0 ]]; do
         -v|--version)
             print_version
             exit 0
+            ;;
+        --verbose)
+            verbose=true
+            shift
             ;;
         --no-inherit)
             no_inherit=true
@@ -495,7 +545,7 @@ while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
         fi
 
         ensure_azure_preflight
-        log_info "${key} を Key Vault から取得中: vault=${vault_name}"
+        log_kv_fetch_start "$key" "$vault_name" "$secret_name" "$version_id"
 
         # az keyvault secret show で実値を取得（stderr は捨て、失敗時はエラー終了）
         # --query value -o tsv で値のみを取り出す
@@ -513,7 +563,7 @@ while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
             </dev/null \
             2>/dev/null); then
             # az コマンドが失敗した場合も、詳細エラーを表示しない（秘匿情報保護）
-            log_error "${key} の取得に失敗しました。アクセス権限・Vault 名・シークレット名・バージョン ID を確認してください。"
+            log_kv_fetch_failure "$key" "$vault_name" "$secret_name" "$version_id"
             exit 1
         fi
         # WSL から Windows 版 az を呼ぶと末尾改行が CRLF になることがある。
