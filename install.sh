@@ -3,17 +3,28 @@
 
 set -euo pipefail
 
-readonly APP_NAME="kvrun"
+readonly PRIMARY_APP_NAME="kvrun"
 readonly MIN_BASH_MAJOR=4
 readonly MIN_BASH_MINOR=3
 readonly DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
+readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly BIN_DIR="${REPO_ROOT}/bin"
+
+declare -a APP_NAMES=(
+    "kvrun"
+    "kvrun-azure"
+)
+declare -a APP_MARKERS=(
+    "# kvrun - Azure Key Vault から環境変数を取得して後続コマンドを起動するラッパースクリプト"
+    "# kvrun-azure - kvrun 利用に必要な Azure 操作を提供する補助スクリプト"
+)
 
 log_info() {
-    echo "[${APP_NAME}] $*" >&2
+    echo "[${PRIMARY_APP_NAME}] $*" >&2
 }
 
 log_error() {
-    echo "[${APP_NAME}] エラー: $*" >&2
+    echo "[${PRIMARY_APP_NAME}] エラー: $*" >&2
 }
 
 usage() {
@@ -23,12 +34,13 @@ usage() {
 オプション:
   --install-dir <ディレクトリ>   インストール先を指定（既定: ${DEFAULT_INSTALL_DIR}）
   --bash-path <bash 実行ファイル> 実行時に固定する Bash を指定
-  --force                       既存の ${APP_NAME} を上書き
+  --force                       既存の配布スクリプトを上書き
   -h, --help                    このヘルプを表示
 
 仕様:
   - 既定では sudo を使わず、ユーザー領域へインストールします
-  - ${APP_NAME} 本体の実行には Bash ${MIN_BASH_MAJOR}.${MIN_BASH_MINOR} 以上が必要です
+  - 配布コマンド: ${APP_NAMES[*]}
+  - 各コマンドの実行には Bash ${MIN_BASH_MAJOR}.${MIN_BASH_MINOR} 以上が必要です
   - インストール時に利用する Bash は絶対パスで固定します
 EOF
 }
@@ -122,11 +134,12 @@ path_contains_dir() {
     return 1
 }
 
-script_contains_kvrun_marker() {
+script_contains_marker() {
     local file_path="$1"
+    local marker="$2"
 
     [[ -f "$file_path" ]] || return 1
-    grep -q '^# kvrun - Azure Key Vault から環境変数を取得して後続コマンドを起動するラッパースクリプト$' "$file_path"
+    grep -Fqx "$marker" "$file_path"
 }
 
 install_dir="${KVRUN_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
@@ -167,19 +180,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly SOURCE_SCRIPT="${REPO_ROOT}/bin/kvrun"
-
-if [[ ! -f "$SOURCE_SCRIPT" ]]; then
-    log_error "インストール元スクリプトが見つかりません: ${SOURCE_SCRIPT}"
-    exit 1
-fi
-
-if [[ ! -r "$SOURCE_SCRIPT" ]]; then
-    log_error "インストール元スクリプトを読み取れません: ${SOURCE_SCRIPT}"
-    exit 1
-fi
-
 resolved_bash_path="$(find_supported_bash "$selected_bash_path")" || exit 1
 readonly resolved_bash_path
 
@@ -189,20 +189,9 @@ if [[ -z "$install_dir" ]]; then
     exit 1
 fi
 
-target_path="${install_dir}/${APP_NAME}"
-readonly target_path
-
 if [[ -e "$install_dir" && ! -d "$install_dir" ]]; then
     log_error "インストール先がディレクトリではありません: ${install_dir}"
     exit 1
-fi
-
-if [[ -e "$target_path" && "$force_overwrite" != true ]]; then
-    if ! script_contains_kvrun_marker "$target_path"; then
-        log_error "既存ファイルを保護するため上書きを中止しました: ${target_path}"
-        log_error "上書きする場合は内容を確認したうえで --force を指定してください。"
-        exit 1
-    fi
 fi
 
 if [[ ! -d "$install_dir" ]]; then
@@ -218,40 +207,73 @@ if [[ ! -w "$install_dir" ]]; then
     exit 1
 fi
 
-if ! temp_file="$(mktemp "${install_dir}/.${APP_NAME}.XXXXXX" 2>/dev/null)"; then
-    log_error "一時ファイルの作成に失敗しました: ${install_dir}"
-    exit 1
-fi
-cleanup() {
-    rm -f "$temp_file"
+install_binary() {
+    local app_name="$1"
+    local marker="$2"
+    local source_script="${BIN_DIR}/${app_name}"
+    local target_path="${install_dir}/${app_name}"
+    local temp_file=""
+
+    if [[ ! -f "$source_script" ]]; then
+        log_error "インストール元スクリプトが見つかりません: ${source_script}"
+        exit 1
+    fi
+
+    if [[ ! -r "$source_script" ]]; then
+        log_error "インストール元スクリプトを読み取れません: ${source_script}"
+        exit 1
+    fi
+
+    if [[ -e "$target_path" && "$force_overwrite" != true ]]; then
+        if ! script_contains_marker "$target_path" "$marker"; then
+            log_error "既存ファイルを保護するため上書きを中止しました: ${target_path}"
+            log_error "上書きする場合は内容を確認したうえで --force を指定してください。"
+            exit 1
+        fi
+    fi
+
+    if ! temp_file="$(mktemp "${install_dir}/.${app_name}.XXXXXX" 2>/dev/null)"; then
+        log_error "一時ファイルの作成に失敗しました: ${install_dir}"
+        exit 1
+    fi
+
+    cleanup_temp_file() {
+        rm -f "$temp_file"
+    }
+    trap cleanup_temp_file RETURN
+
+    {
+        printf '#!%s\n' "$resolved_bash_path"
+        tail -n +2 "$source_script"
+    } > "$temp_file" 2>/dev/null || {
+        log_error "インストール用ファイルの生成に失敗しました: ${app_name}"
+        exit 1
+    }
+
+    if ! chmod 700 "$temp_file" 2>/dev/null; then
+        log_error "インストール用ファイルの権限設定に失敗しました: ${app_name}"
+        exit 1
+    fi
+
+    if ! mv -f "$temp_file" "$target_path" 2>/dev/null; then
+        log_error "インストール先への配置に失敗しました: ${target_path}"
+        exit 1
+    fi
+
+    trap - RETURN
+    cleanup_temp_file
+
+    log_info "インストール完了: ${target_path}"
 }
-trap cleanup EXIT
 
-{
-    printf '#!%s\n' "$resolved_bash_path"
-    tail -n +2 "$SOURCE_SCRIPT"
-} > "$temp_file" 2>/dev/null || {
-    log_error "インストール用ファイルの生成に失敗しました。"
-    exit 1
-}
+for i in "${!APP_NAMES[@]}"; do
+    install_binary "${APP_NAMES[$i]}" "${APP_MARKERS[$i]}"
+done
 
-if ! chmod 700 "$temp_file" 2>/dev/null; then
-    log_error "インストール用ファイルの権限設定に失敗しました。"
-    exit 1
-fi
-
-if ! mv -f "$temp_file" "$target_path" 2>/dev/null; then
-    log_error "インストール先への配置に失敗しました: ${target_path}"
-    exit 1
-fi
-
-trap - EXIT
-
-log_info "インストール完了: ${target_path}"
 log_info "実行時に使用する Bash: ${resolved_bash_path}"
 
 if path_contains_dir "$install_dir"; then
-    log_info "このまま '${APP_NAME} --help' を実行できます。"
+    log_info "このまま 'kvrun --help' と 'kvrun-azure --help' を実行できます。"
 else
     log_info "PATH に ${install_dir} が含まれていません。"
     log_info "例: export PATH=\"${install_dir}:\$PATH\""
