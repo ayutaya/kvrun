@@ -1,0 +1,63 @@
+name: cross-platform-test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Bash 4+ テスト (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    defaults:
+      run:
+        shell: sh
+
+    steps:
+      - name: ソースコードを取得
+        uses: actions/checkout@v4
+
+      - name: Bash 4 以上を準備
+        run: |
+          set -eu
+
+          if bash -lc 'exit $(( BASH_VERSINFO[0] >= 4 ? 0 : 1 ))' 2>/dev/null; then
+            :
+          elif [ "${RUNNER_OS}" = "macOS" ]; then
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            brew install bash
+
+            bash_bin_dir="$(brew --prefix bash)/bin"
+            export PATH="${bash_bin_dir}:${PATH}"
+            printf '%s\n' "${bash_bin_dir}" >> "${GITHUB_PATH}"
+          else
+            echo "Bash 4 以上を利用できません。" >&2
+            exit 1
+          fi
+
+          if ! bash -lc 'exit $(( BASH_VERSINFO[0] >= 4 ? 0 : 1 ))' 2>/dev/null; then
+            echo "Bash 4 以上の準備に失敗しました。" >&2
+            echo "現在の bash: $(command -v bash)" >&2
+            bash --version | head -n 1 >&2 || true
+            exit 1
+          fi
+
+          echo "利用する bash: $(command -v bash)"
+          bash --version | head -n 1
+
+      - name: テストを実行
+        run: |
+          set -eu
+          bash tests/run_test.sh
