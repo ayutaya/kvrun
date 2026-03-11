@@ -9,6 +9,8 @@ readonly MIN_BASH_MINOR=3
 readonly DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly BIN_DIR="${REPO_ROOT}/bin"
+readonly VERSION_FILE="${REPO_ROOT}/VERSION"
+readonly VERSION_PLACEHOLDER="__KVRUN_VERSION__"
 
 declare -a APP_NAMES=(
     "kvrun"
@@ -50,6 +52,24 @@ trim() {
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
     printf '%s' "$value"
+}
+
+load_release_version() {
+    local version=""
+
+    if [[ ! -r "$VERSION_FILE" ]]; then
+        log_error "バージョン定義ファイルを読み取れません: ${VERSION_FILE}"
+        exit 1
+    fi
+
+    IFS= read -r version < "$VERSION_FILE" || true
+    version="$(trim "$version")"
+    if [[ -z "$version" ]]; then
+        log_error "バージョン定義ファイルが空です: ${VERSION_FILE}"
+        exit 1
+    fi
+
+    printf '%s\n' "$version"
 }
 
 bash_version_of() {
@@ -182,6 +202,8 @@ done
 
 resolved_bash_path="$(find_supported_bash "$selected_bash_path")" || exit 1
 readonly resolved_bash_path
+release_version="$(load_release_version)"
+readonly release_version
 
 install_dir="${install_dir%/}"
 if [[ -z "$install_dir" ]]; then
@@ -244,7 +266,7 @@ install_binary() {
 
     {
         printf '#!%s\n' "$resolved_bash_path"
-        tail -n +2 "$source_script"
+        tail -n +2 "$source_script" | sed "s/${VERSION_PLACEHOLDER}/${release_version}/g"
     } > "$temp_file" 2>/dev/null || {
         log_error "インストール用ファイルの生成に失敗しました: ${app_name}"
         exit 1

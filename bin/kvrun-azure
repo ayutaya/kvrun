@@ -4,12 +4,46 @@
 set -euo pipefail
 
 readonly SCRIPT_NAME="kvrun-azure"
-readonly SCRIPT_VERSION="0.1.0"
+readonly VERSION_PLACEHOLDER="__KVRUN_VERSION__"
+readonly VERSION_PLACEHOLDER_SENTINEL="__KVRUN_"'VERSION__'
 readonly DEFAULT_SECRET_YEARS=2
 readonly ROLE_NAME="Key Vault Secrets User"
 readonly AZURE_VAULT_NAME_REGEX='^[A-Za-z0-9-]{3,24}$'
 readonly AZURE_SECRET_NAME_REGEX='^[A-Za-z0-9-]{1,127}$'
 readonly MIN_ROLE_ASSIGNMENT_RETRY=10
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+resolve_version() {
+    local script_dir=""
+    local version_file=""
+    local version=""
+
+    if [[ "$VERSION_PLACEHOLDER" != "$VERSION_PLACEHOLDER_SENTINEL" ]]; then
+        printf '%s' "$VERSION_PLACEHOLDER"
+        return
+    fi
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    version_file="${script_dir}/../VERSION"
+    if [[ -r "$version_file" ]]; then
+        IFS= read -r version < "$version_file" || true
+        version="$(trim "$version")"
+        if [[ -n "$version" ]]; then
+            printf '%s' "$version"
+            return
+        fi
+    fi
+
+    printf '%s' '0.0.0-dev'
+}
+
+readonly SCRIPT_VERSION="$(resolve_version)"
 
 log_info() {
     echo "[${SCRIPT_NAME}] $*" >&2

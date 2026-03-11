@@ -1,0 +1,116 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "リリースするバージョン。`0.#.#` または `v0.#.#` 形式を指定できます。"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.repository.default_branch }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: VERSION 更新とタグ作成
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: バージョン入力を正規化
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          input_version='${{ github.event.inputs.version }}'
+          normalized_version="${input_version#v}"
+
+          if [[ ! "$normalized_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "無効なバージョンです: ${input_version}" >&2
+            exit 1
+          fi
+
+          echo "version=${normalized_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${normalized_version}" >> "$GITHUB_OUTPUT"
+
+      - name: ソースコードを取得
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: 既存タグを確認
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "タグは既に存在します: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "リモートに同名タグが既に存在します: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+      - name: VERSION を更新
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RELEASE_VERSION" > VERSION
+
+      - name: VERSION の差分を確認
+        id: version_diff
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- VERSION; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Git を設定
+        if: steps.version_diff.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: VERSION 更新コミットを作成
+        if: steps.version_diff.outputs.changed == 'true'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git add VERSION
+          git commit -m "chore: release ${RELEASE_TAG}"
+
+      - name: VERSION 更新コミットを push
+        if: steps.version_diff.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin HEAD:${{ github.event.repository.default_branch }}
+
+      - name: タグを作成して push
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag -a "$RELEASE_TAG" -m "Release ${RELEASE_TAG}"
+          git push origin "$RELEASE_TAG"
