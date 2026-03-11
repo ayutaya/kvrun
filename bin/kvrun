@@ -32,7 +32,41 @@ readonly AZURE_SECRET_VERSION_ID_REGEX='^[A-Za-z0-9]+$'
 readonly ALLOW_UNSAFE_COMMANDS_ENV="KVRUN_ALLOW_UNSAFE_COMMANDS"
 readonly MIN_BASH_MAJOR=4
 readonly MIN_BASH_MINOR=3
-readonly KVRUN_VERSION="0.1.0"
+readonly VERSION_PLACEHOLDER="__KVRUN_VERSION__"
+readonly VERSION_PLACEHOLDER_SENTINEL="__KVRUN_"'VERSION__'
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+resolve_version() {
+    local script_dir=""
+    local version_file=""
+    local version=""
+
+    if [[ "$VERSION_PLACEHOLDER" != "$VERSION_PLACEHOLDER_SENTINEL" ]]; then
+        printf '%s' "$VERSION_PLACEHOLDER"
+        return
+    fi
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    version_file="${script_dir}/../VERSION"
+    if [[ -r "$version_file" ]]; then
+        IFS= read -r version < "$version_file" || true
+        version="$(trim "$version")"
+        if [[ -n "$version" ]]; then
+            printf '%s' "$version"
+            return
+        fi
+    fi
+
+    printf '%s' '0.0.0-dev'
+}
+
+readonly KVRUN_VERSION="$(resolve_version)"
 
 # ===========================================================================
 # ヘルプ表示
@@ -110,16 +144,6 @@ require_supported_bash() {
 }
 
 require_supported_bash
-
-# ===========================================================================
-# 文字列ユーティリティ
-# ===========================================================================
-trim() {
-    local value="$1"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    printf '%s' "$value"
-}
 
 split_csv_to_array() {
     local raw="$1"

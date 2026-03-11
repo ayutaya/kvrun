@@ -20,12 +20,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BIN="${REPO_ROOT}/bin/kvrun"
 AZURE_BIN="${REPO_ROOT}/bin/kvrun-azure"
 INSTALL_SCRIPT="${REPO_ROOT}/install.sh"
+VERSION_FILE="${REPO_ROOT}/VERSION"
 ENV_FILE="${SCRIPT_DIR}/.env.test"
 KEYVAULT_NAME="${KEYVAULT_NAME:-}"
 KEYVAULT_DB_PASSWORD_SECRET_NAME="${KEYVAULT_DB_PASSWORD_SECRET_NAME:-db-password}"
 KEYVAULT_TEST_SECRET_NAME="${KEYVAULT_TEST_SECRET_NAME:-test-secret}"
 KEYVAULT_DB_PASSWORD_VERSION="${KEYVAULT_DB_PASSWORD_VERSION:-}"
 SYSTEM_PATH="${PATH:-/usr/bin:/bin}"
+KVRUN_VERSION="$(tr -d '\r\n' < "$VERSION_FILE")"
 
 # ---------------------------------------------------------------------------
 # ユーティリティ
@@ -468,10 +470,16 @@ elif ! echo "$OUTPUT" | grep -q "PATH に"; then
 else
     RUN_OUTPUT="$(HOME="$TMP_HOME" PATH="${TMP_HOME}/.local/bin:${SYSTEM_PATH}" kvrun --help 2>&1)" || true
     RUN_OUTPUT_AZURE="$(HOME="$TMP_HOME" PATH="${TMP_HOME}/.local/bin:${SYSTEM_PATH}" kvrun-azure --help 2>&1)" || true
+    VERSION_OUTPUT="$(HOME="$TMP_HOME" PATH="${TMP_HOME}/.local/bin:${SYSTEM_PATH}" kvrun --version 2>&1)" || true
+    VERSION_OUTPUT_AZURE="$(HOME="$TMP_HOME" PATH="${TMP_HOME}/.local/bin:${SYSTEM_PATH}" kvrun-azure --version 2>&1)" || true
     if ! echo "$RUN_OUTPUT" | grep -q "Bash 4.3 以上"; then
         fail "インストール後の kvrun 実行に失敗した（出力: ${RUN_OUTPUT})"
     elif ! echo "$RUN_OUTPUT_AZURE" | grep -q "vault create"; then
         fail "インストール後の kvrun-azure 実行に失敗した（出力: ${RUN_OUTPUT_AZURE})"
+    elif [[ "$VERSION_OUTPUT" != "kvrun ${KVRUN_VERSION}" ]]; then
+        fail "インストール後の kvrun --version が想定外（出力: ${VERSION_OUTPUT})"
+    elif [[ "$VERSION_OUTPUT_AZURE" != "kvrun-azure ${KVRUN_VERSION}" ]]; then
+        fail "インストール後の kvrun-azure --version が想定外（出力: ${VERSION_OUTPUT_AZURE})"
     else
         pass "install.sh で配置した 2 つのコマンドを PATH 経由で実行できた"
     fi
@@ -522,14 +530,14 @@ rm -rf "$TMP_INSTALL_DIR"
 # ---------------------------------------------------------------------------
 section "22. kvrun のバージョン表示"
 OUTPUT="$(bash "$BIN" --version 2>&1)" || true
-if [[ "$OUTPUT" == "kvrun 0.1.0" ]]; then
+if [[ "$OUTPUT" == "kvrun ${KVRUN_VERSION}" ]]; then
     pass "--version で期待したバージョンを表示できた"
 else
     fail "--version の出力が想定外（出力: ${OUTPUT})"
 fi
 
 OUTPUT="$(bash "$BIN" -v 2>&1)" || true
-if [[ "$OUTPUT" == "kvrun 0.1.0" ]]; then
+if [[ "$OUTPUT" == "kvrun ${KVRUN_VERSION}" ]]; then
     pass "-v でも期待したバージョンを表示できた"
 else
     fail "-v の出力が想定外（出力: ${OUTPUT})"
