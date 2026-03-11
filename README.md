@@ -155,6 +155,7 @@ kvrun <.env ファイルパス> <コマンド> [引数...]
 |-----------|------|
 | `-h`, `--help` | ヘルプを表示 |
 | `-v`, `--version` | バージョンを表示 |
+| `--verbose` | Key Vault 参照の詳細ログを表示 |
 | `--no-inherit` | 現在の環境変数を引き継がず `.env` の内容のみを渡す |
 | `--` | オプション解析を終了 |
 
@@ -186,6 +187,9 @@ LOG_LEVEL=debug
 ```bash
 # PHP Artisan を Key Vault の環境変数つきで起動
 kvrun .env php artisan serve
+
+# Key Vault 参照のキー名や Vault 名も含めて確認
+kvrun --verbose .env php artisan serve
 
 # バージョン確認
 kvrun --version
