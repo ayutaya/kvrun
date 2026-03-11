@@ -18,6 +18,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BIN="${REPO_ROOT}/bin/kvrun"
+AZURE_BIN="${REPO_ROOT}/bin/kvrun-azure"
 INSTALL_SCRIPT="${REPO_ROOT}/install.sh"
 ENV_FILE="${SCRIPT_DIR}/.env.test"
 KEYVAULT_NAME="${KEYVAULT_NAME:-}"
@@ -277,10 +278,6 @@ else
     echo "  .env.test: ${ENV_FILE}"
     OUTPUT="$(KVRUN_ALLOW_UNSAFE_COMMANDS=1 bash "$BIN" --no-inherit "$ENV_FILE" env 2>/dev/null)" || true
 
-    # テストのために出力全体を表示（実際の値は伏せるべきだが、テスト環境なので許容）
-    echo "  OUTPUT:"
-    echo "$OUTPUT"
-
     if echo "$OUTPUT" | grep -q "^DB_PASSWORD="; then
         RESOLVED_VAL="$(echo "$OUTPUT" | grep '^DB_PASSWORD=' | cut -d= -f2-)"
         if [[ "$RESOLVED_VAL" != "kv://"* && -n "$RESOLVED_VAL" ]]; then
@@ -453,20 +450,30 @@ section "19. install.sh でユーザー領域へインストールできる"
 TMP_HOME="$(mktemp -d)"
 OUTPUT="$(HOME="$TMP_HOME" PATH="/usr/bin:/bin" bash "$INSTALL_SCRIPT" 2>&1)" || true
 INSTALLED_BIN="${TMP_HOME}/.local/bin/kvrun"
+INSTALLED_AZURE_BIN="${TMP_HOME}/.local/bin/kvrun-azure"
 if [[ ! -f "$INSTALLED_BIN" ]]; then
     fail "install.sh 実行後も kvrun が配置されていない（出力: ${OUTPUT})"
+elif [[ ! -f "$INSTALLED_AZURE_BIN" ]]; then
+    fail "install.sh 実行後も kvrun-azure が配置されていない（出力: ${OUTPUT})"
+elif [[ -f "${TMP_HOME}/.local/bin/kvrun-azure-setup" ]]; then
+    fail "install.sh 実行後に廃止済みの kvrun-azure-setup が配置されている"
 elif ! head -n 1 "$INSTALLED_BIN" | grep -Eq '^#!/.*/bash$'; then
     fail "インストール後の shebang が Bash の絶対パスになっていない"
 elif head -n 1 "$INSTALLED_BIN" | grep -q '^#!/usr/bin/env bash$'; then
     fail "インストール後も env bash のままになっている"
+elif ! head -n 1 "$INSTALLED_AZURE_BIN" | grep -Eq '^#!/.*/bash$'; then
+    fail "kvrun-azure の shebang が Bash の絶対パスになっていない"
 elif ! echo "$OUTPUT" | grep -q "PATH に"; then
     fail "PATH 未設定時の案内が表示されていない（出力: ${OUTPUT})"
 else
     RUN_OUTPUT="$(HOME="$TMP_HOME" PATH="${TMP_HOME}/.local/bin:${SYSTEM_PATH}" kvrun --help 2>&1)" || true
-    if echo "$RUN_OUTPUT" | grep -q "Bash 4.3 以上"; then
-        pass "install.sh で配置した kvrun を PATH 経由で実行できた"
-    else
+    RUN_OUTPUT_AZURE="$(HOME="$TMP_HOME" PATH="${TMP_HOME}/.local/bin:${SYSTEM_PATH}" kvrun-azure --help 2>&1)" || true
+    if ! echo "$RUN_OUTPUT" | grep -q "Bash 4.3 以上"; then
         fail "インストール後の kvrun 実行に失敗した（出力: ${RUN_OUTPUT})"
+    elif ! echo "$RUN_OUTPUT_AZURE" | grep -q "vault create"; then
+        fail "インストール後の kvrun-azure 実行に失敗した（出力: ${RUN_OUTPUT_AZURE})"
+    else
+        pass "install.sh で配置した 2 つのコマンドを PATH 経由で実行できた"
     fi
 fi
 rm -rf "$TMP_HOME"
@@ -527,6 +534,400 @@ if [[ "$OUTPUT" == "kvrun 0.1.0" ]]; then
 else
     fail "-v の出力が想定外（出力: ${OUTPUT})"
 fi
+
+# ---------------------------------------------------------------------------
+# テスト 23: kvrun-azure のヘルプ表示
+# ---------------------------------------------------------------------------
+section "23. kvrun-azure のヘルプ表示"
+OUTPUT="$(bash "$AZURE_BIN" --help 2>&1)" || true
+if echo "$OUTPUT" | grep -q "使い方" && echo "$OUTPUT" | grep -q "app add-client-secret" && echo "$OUTPUT" | grep -q "vault create" && echo "$OUTPUT" | grep -q "secret add"; then
+    pass "kvrun-azure --help が正常に表示された"
+else
+    fail "kvrun-azure --help の出力が想定外（出力: ${OUTPUT})"
+fi
+
+# ---------------------------------------------------------------------------
+# テスト 24: kvrun-azure vault create が Azure 初期構築コマンドを組み立てる
+# ---------------------------------------------------------------------------
+section "24. kvrun-azure vault create が Azure 初期構築コマンドを組み立てる"
+FAKE_AZ_DIR="$(mktemp -d)"
+FAKE_AZ_LOG="${FAKE_AZ_DIR}/az.log"
+cat > "${FAKE_AZ_DIR}/az" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+
+log_file="${FAKE_AZ_LOG:?}"
+printf '%s\n' "$*" >> "$log_file"
+
+find_arg() {
+  local flag="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$flag" ]]; then
+      printf '%s' "${2:-}"
+      return 0
+    fi
+    shift
+  done
+
+  return 1
+}
+
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  query="$(find_arg --query "$@")"
+  if [[ "$query" == "tenantId" ]]; then
+    echo "tenant-123"
+  elif [[ "$query" == "id" ]]; then
+    echo "sub-123"
+  else
+    echo "unexpected account query: ${query}" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ "$1" == "group" && "$2" == "show" ]]; then
+  echo "japaneast"
+  exit 0
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "show" ]]; then
+  exit 1
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "create" ]]; then
+  vault_name="$(find_arg --name "$@")"
+  resource_group="$(find_arg --resource-group "$@")"
+  subscription_id="$(find_arg --subscription "$@")"
+  printf '/subscriptions/%s/resourceGroups/%s/providers/Microsoft.KeyVault/vaults/%s\n' \
+    "$subscription_id" "$resource_group" "$vault_name"
+  exit 0
+fi
+
+if [[ "$1" == "ad" && "$2" == "app" && "$3" == "create" ]]; then
+  echo "app-123"
+  exit 0
+fi
+
+if [[ "$1" == "ad" && "$2" == "app" && "$3" == "credential" && "$4" == "reset" ]]; then
+  echo "secret-value-123"
+  exit 0
+fi
+
+if [[ "$1" == "ad" && "$2" == "sp" && "$3" == "create" ]]; then
+  echo "sp-object-123"
+  exit 0
+fi
+
+if [[ "$1" == "role" && "$2" == "assignment" && "$3" == "create" ]]; then
+  exit 0
+fi
+
+echo "unexpected az args: $*" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az"
+OUTPUT="$(PATH="${FAKE_AZ_DIR}:${SYSTEM_PATH}" FAKE_AZ_LOG="${FAKE_AZ_LOG}" bash "$AZURE_BIN" \
+  vault create \
+  --resource-group "app-rg" \
+  --name "my-app-dev-kv" 2>&1)" || true
+if ! echo "$OUTPUT" | grep -q "az login --service-principal --username app-123 --tenant tenant-123 && az account set --subscription sub-123"; then
+    fail "az login コマンドの出力が想定外（出力: ${OUTPUT})"
+elif ! echo "$OUTPUT" | grep -q "App ID: app-123"; then
+    fail "Key Vault 作成の App ID 出力が想定外（出力: ${OUTPUT})"
+elif ! echo "$OUTPUT" | grep -q "Password(Secret): secret-value-123"; then
+    fail "Key Vault 作成のシークレット出力が想定外（出力: ${OUTPUT})"
+elif ! grep -q "keyvault create --name my-app-dev-kv --resource-group app-rg --location japaneast --enable-rbac-authorization true --subscription sub-123 --query id --output tsv --only-show-errors" "${FAKE_AZ_LOG}"; then
+    fail "Key Vault 作成コマンドが想定どおりに呼ばれていない"
+elif ! grep -q "role assignment create --assignee-object-id sp-object-123 --assignee-principal-type ServicePrincipal --role Key Vault Secrets User --scope /subscriptions/sub-123/resourceGroups/app-rg/providers/Microsoft.KeyVault/vaults/my-app-dev-kv --subscription sub-123 --only-show-errors" "${FAKE_AZ_LOG}"; then
+    fail "Key Vault へのロール割り当てが想定どおりに呼ばれていない"
+else
+    pass "kvrun-azure vault create が Azure リソース作成と az login コマンド表示を正しく組み立てた"
+fi
+rm -rf "${FAKE_AZ_DIR}"
+
+# ---------------------------------------------------------------------------
+# テスト 25: kvrun-azure vault create は必須引数不足を案内する
+# ---------------------------------------------------------------------------
+section "25. kvrun-azure vault create は必須引数不足を案内する"
+OUTPUT="$(bash "$AZURE_BIN" vault create --name my-app-dev-kv 2>&1)" || true
+if echo "$OUTPUT" | grep -q -- "--resource-group と --name を指定"; then
+    pass "必須の名前付き引数不足を適切に案内できた"
+else
+    fail "名前付き引数不足時の案内が想定外（出力: ${OUTPUT})"
+fi
+
+# ---------------------------------------------------------------------------
+# テスト 26: kvrun-azure app add-client-secret が追加シークレットを発行する
+# ---------------------------------------------------------------------------
+section "26. kvrun-azure app add-client-secret が追加シークレットを発行する"
+FAKE_AZ_DIR="$(mktemp -d)"
+FAKE_AZ_LOG="${FAKE_AZ_DIR}/az.log"
+cat > "${FAKE_AZ_DIR}/az" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+
+log_file="${FAKE_AZ_LOG:?}"
+printf '%s\n' "$*" >> "$log_file"
+
+find_arg() {
+  local flag="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$flag" ]]; then
+      printf '%s' "${2:-}"
+      return 0
+    fi
+    shift
+  done
+
+  return 1
+}
+
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  query="$(find_arg --query "$@")"
+  if [[ "$query" == "tenantId" ]]; then
+    echo "tenant-123"
+  elif [[ "$query" == "id" ]]; then
+    echo "sub-123"
+  else
+    echo "unexpected account query: ${query}" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ "$1" == "ad" && "$2" == "app" && "$3" == "credential" && "$4" == "reset" ]]; then
+  echo "secret-value-456"
+  exit 0
+fi
+
+echo "unexpected az args: $*" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az"
+OUTPUT="$(PATH="${FAKE_AZ_DIR}:${SYSTEM_PATH}" FAKE_AZ_LOG="${FAKE_AZ_LOG}" bash "$AZURE_BIN" \
+  app add-client-secret \
+  --app-id "app-123" 2>&1)" || true
+if ! echo "$OUTPUT" | grep -q "App ID: app-123"; then
+    fail "app add-client-secret の App ID 出力が想定外（出力: ${OUTPUT})"
+elif ! echo "$OUTPUT" | grep -q "Tenant ID: tenant-123"; then
+    fail "app add-client-secret の Tenant ID 出力が想定外（出力: ${OUTPUT})"
+elif ! echo "$OUTPUT" | grep -q "Password(Secret): secret-value-456"; then
+    fail "app add-client-secret のシークレット出力が想定外（出力: ${OUTPUT})"
+elif ! grep -q "ad app credential reset --id app-123 --display-name kvrun-login --years 2 --query password --append --output tsv --only-show-errors" "${FAKE_AZ_LOG}"; then
+    fail "app add-client-secret が append 付きで呼ばれていない"
+else
+    pass "kvrun-azure app add-client-secret が追加シークレットを正しく発行できた"
+fi
+rm -rf "${FAKE_AZ_DIR}"
+
+# ---------------------------------------------------------------------------
+# テスト 27: kvrun-azure app add-client-secret は必須引数不足を案内する
+# ---------------------------------------------------------------------------
+section "27. kvrun-azure app add-client-secret は必須引数不足を案内する"
+OUTPUT="$(bash "$AZURE_BIN" app add-client-secret 2>&1)" || true
+if echo "$OUTPUT" | grep -q -- "--app-id を指定"; then
+    pass "app add-client-secret の必須引数不足を適切に案内できた"
+else
+    fail "app add-client-secret の必須引数不足案内が想定外（出力: ${OUTPUT})"
+fi
+
+# ---------------------------------------------------------------------------
+# テスト 28: kvrun-azure secret add が Key Vault へシークレットを追加する
+# ---------------------------------------------------------------------------
+section "28. kvrun-azure secret add が Key Vault へシークレットを追加する"
+FAKE_AZ_DIR="$(mktemp -d)"
+FAKE_AZ_LOG="${FAKE_AZ_DIR}/az.log"
+cat > "${FAKE_AZ_DIR}/az" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+
+log_file="${FAKE_AZ_LOG:?}"
+printf '%s\n' "$*" >> "$log_file"
+
+find_arg() {
+  local flag="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$flag" ]]; then
+      printf '%s' "${2:-}"
+      return 0
+    fi
+    shift
+  done
+
+  return 1
+}
+
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  query="$(find_arg --query "$@")"
+  if [[ "$query" == "id" ]]; then
+    echo "sub-123"
+    exit 0
+  fi
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "show" ]]; then
+  echo "/subscriptions/sub-123/resourceGroups/app-rg/providers/Microsoft.KeyVault/vaults/my-app-dev-kv"
+  exit 0
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "secret" && "$3" == "set" ]]; then
+  echo "https://my-app-dev-kv.vault.azure.net/secrets/db-password/version-123"
+  exit 0
+fi
+
+echo "unexpected az args: $*" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az"
+OUTPUT="$(printf 'secret-value-999\n' | PATH="${FAKE_AZ_DIR}:${SYSTEM_PATH}" FAKE_AZ_LOG="${FAKE_AZ_LOG}" bash "$AZURE_BIN" \
+  secret add \
+  --resource-group "app-rg" \
+  --name "my-app-dev-kv" \
+  --secret-name "db-password" 2>&1)" || true
+if ! echo "$OUTPUT" | grep -q "シークレット追加完了"; then
+    fail "secret add の成功メッセージが想定外（出力: ${OUTPUT})"
+elif ! echo "$OUTPUT" | grep -q "kv://my-app-dev-kv/db-password#version-123"; then
+    fail "secret add の参照出力が想定外（出力: ${OUTPUT})"
+elif ! grep -q "keyvault secret set --vault-name my-app-dev-kv --name db-password --value secret-value-999 --subscription sub-123 --query id --output tsv --only-show-errors" "${FAKE_AZ_LOG}"; then
+    fail "keyvault secret set が想定どおりに呼ばれていない"
+else
+    pass "kvrun-azure secret add が標準入力の値で Key Vault へシークレットを追加できた"
+fi
+rm -rf "${FAKE_AZ_DIR}"
+
+# ---------------------------------------------------------------------------
+# テスト 29: kvrun-azure secret add は空のシークレット値を拒否する
+# ---------------------------------------------------------------------------
+section "29. kvrun-azure secret add は空のシークレット値を拒否する"
+FAKE_AZ_DIR="$(mktemp -d)"
+FAKE_AZ_LOG="${FAKE_AZ_DIR}/az.log"
+cat > "${FAKE_AZ_DIR}/az" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+
+log_file="${FAKE_AZ_LOG:?}"
+printf '%s\n' "$*" >> "$log_file"
+
+find_arg() {
+  local flag="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$flag" ]]; then
+      printf '%s' "${2:-}"
+      return 0
+    fi
+    shift
+  done
+
+  return 1
+}
+
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  query="$(find_arg --query "$@")"
+  if [[ "$query" == "id" ]]; then
+    echo "sub-123"
+    exit 0
+  fi
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "show" ]]; then
+  echo "/subscriptions/sub-123/resourceGroups/app-rg/providers/Microsoft.KeyVault/vaults/my-app-dev-kv"
+  exit 0
+fi
+
+echo "unexpected az args: $*" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az"
+OUTPUT="$(printf '\n' | PATH="${FAKE_AZ_DIR}:${SYSTEM_PATH}" FAKE_AZ_LOG="${FAKE_AZ_LOG}" bash "$AZURE_BIN" \
+  secret add \
+  --resource-group "app-rg" \
+  --name "my-app-dev-kv" \
+  --secret-name "db-password" 2>&1)" || true
+if ! echo "$OUTPUT" | grep -q "シークレット値が空"; then
+    fail "空のシークレット値に対する案内が想定外（出力: ${OUTPUT})"
+elif grep -q "keyvault secret set" "${FAKE_AZ_LOG}"; then
+    fail "空入力でも keyvault secret set が呼ばれてしまった"
+else
+    pass "kvrun-azure secret add が空のシークレット値を拒否できた"
+fi
+rm -rf "${FAKE_AZ_DIR}"
+
+# ---------------------------------------------------------------------------
+# テスト 30: kvrun-azure secret add は既存シークレットを非対話で上書きしない
+# ---------------------------------------------------------------------------
+section "30. kvrun-azure secret add は既存シークレットを非対話で上書きしない"
+FAKE_AZ_DIR="$(mktemp -d)"
+FAKE_AZ_LOG="${FAKE_AZ_DIR}/az.log"
+cat > "${FAKE_AZ_DIR}/az" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+
+log_file="${FAKE_AZ_LOG:?}"
+printf '%s\n' "$*" >> "$log_file"
+
+find_arg() {
+  local flag="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$flag" ]]; then
+      printf '%s' "${2:-}"
+      return 0
+    fi
+    shift
+  done
+
+  return 1
+}
+
+if [[ "$1" == "account" && "$2" == "show" ]]; then
+  query="$(find_arg --query "$@")"
+  if [[ "$query" == "id" ]]; then
+    echo "sub-123"
+    exit 0
+  fi
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "show" ]]; then
+  echo "/subscriptions/sub-123/resourceGroups/app-rg/providers/Microsoft.KeyVault/vaults/my-app-dev-kv"
+  exit 0
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "secret" && "$3" == "show" ]]; then
+  echo "https://my-app-dev-kv.vault.azure.net/secrets/db-password/version-123"
+  exit 0
+fi
+
+if [[ "$1" == "keyvault" && "$2" == "secret" && "$3" == "set" ]]; then
+  echo "unexpected overwrite" >&2
+  exit 1
+fi
+
+echo "unexpected az args: $*" >&2
+exit 1
+EOF
+chmod +x "${FAKE_AZ_DIR}/az"
+OUTPUT="$(printf 'secret-value-999\n' | PATH="${FAKE_AZ_DIR}:${SYSTEM_PATH}" FAKE_AZ_LOG="${FAKE_AZ_LOG}" bash "$AZURE_BIN" \
+  secret add \
+  --resource-group "app-rg" \
+  --name "my-app-dev-kv" \
+  --secret-name "db-password" 2>&1)" || true
+if ! echo "$OUTPUT" | grep -q "上書き確認ができません"; then
+    fail "既存シークレットの非対話上書き拒否メッセージが想定外（出力: ${OUTPUT})"
+elif grep -q "keyvault secret set" "${FAKE_AZ_LOG}"; then
+    fail "既存シークレット検知後も keyvault secret set が呼ばれてしまった"
+else
+    pass "kvrun-azure secret add が既存シークレットの非対話上書きを拒否できた"
+fi
+rm -rf "${FAKE_AZ_DIR}"
 
 # ---------------------------------------------------------------------------
 # テスト結果サマリー

@@ -17,6 +17,11 @@
 bash install.sh
 ```
 
+インストール後は次の 2 コマンドを利用できます。
+
+- `kvrun`
+- `kvrun-azure`
+
 別のディレクトリへ入れる場合:
 
 ```bash
@@ -49,6 +54,94 @@ bash install.sh
 - Azure CLIが動作する環境
 - `az login` でログイン済みであること
 - 対象 Key Vault のシークレット読み取り権限（`Key Vault Secrets User` ロール等）があること
+
+## Azure 側操作
+
+`kvrun-azure` は、`kvrun` 利用時に必要な Azure 側の操作をサブコマンドで提供します。
+
+利用できるサブコマンド:
+
+- `kvrun-azure app add-client-secret`
+- `kvrun-azure vault create`
+- `kvrun-azure secret add`
+
+### Key Vault とサービスプリンシパルの初期作成
+
+`kvrun-azure vault create` は、指定した作成先リソースグループが属する subscription / location を使って、`kvrun` 利用に必要な Azure 側リソースをまとめて作成します。
+
+作成されるもの:
+
+- RBAC 有効な Azure Key Vault
+- 専用の Entra ID アプリ
+- 上記アプリのサービスプリンシパル
+- Key Vault への `Key Vault Secrets User` ロール割り当て
+
+実行例:
+
+```bash
+kvrun-azure vault create \
+  --resource-group my-app-rg \
+  --name my-app-dev-kv
+```
+
+必要に応じて対象 subscription を明示できます。
+
+```bash
+kvrun-azure vault create \
+  --resource-group my-app-rg \
+  --name my-app-dev-kv \
+  --subscription 00000000-0000-0000-0000-000000000000
+```
+
+必要に応じて Entra ID アプリ名やシークレット年数も指定できます。
+
+```bash
+kvrun-azure vault create --resource-group my-app-rg --name my-app-dev-kv --display-name kvrun-my-app-dev --years 1
+```
+
+完了すると、作成したサービスプリンシパルの `App ID`、`Tenant ID`、`az login` コマンドを 1 行で表示します。表示されるクライアントシークレットはその出力でのみ確認してください。
+
+### 既存 Entra ID アプリへのクライアントシークレット追加
+
+`kvrun-azure app add-client-secret` は、既存の Entra ID アプリへ追加のクライアントシークレットを発行します。`vault create` 実行時に表示された `App ID` を指定して、他の開発者向けのログイン情報を必要なタイミングで追加発行する想定です。
+
+```bash
+kvrun-azure app add-client-secret \
+  --app-id 00000000-0000-0000-0000-000000000000
+```
+
+表示名や有効年数を変える場合:
+
+```bash
+kvrun-azure app add-client-secret \
+  --app-id 00000000-0000-0000-0000-000000000000 \
+  --display-name teammate-login \
+  --years 1
+```
+
+完了すると、対象 `App ID`、`Tenant ID`、追加された `Password(Secret)`、そのまま使える `az login` コマンドを表示します。
+
+### 既存 Key Vault へのシークレット追加
+
+`kvrun-azure secret add` は、既存の Key Vault に新しいシークレットを追加します。値は TTY 接続時に非表示で対話入力し、非 TTY 時は標準入力から読み取ります。
+同名シークレットが既に存在する場合、TTY では上書き確認を行い、非対話実行では安全のため中止します。
+追加後は、新しい参照先として `kv://<vault-name>/<secret-name>#<version-id>` 形式を出力します。
+
+```bash
+kvrun-azure secret add \
+  --resource-group my-app-rg \
+  --name my-app-dev-kv \
+  --secret-name db-password
+```
+
+非対話で流し込む場合:
+
+```bash
+printf 'super-secret\n' | kvrun-azure secret add \
+  --resource-group my-app-rg \
+  --name my-app-dev-kv \
+  --secret-name db-password
+```
 
 ### 使い方
 

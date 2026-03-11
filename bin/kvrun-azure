@@ -1,0 +1,922 @@
+#!/usr/bin/env bash
+# kvrun-azure - kvrun 利用に必要な Azure 操作を提供する補助スクリプト
+
+set -euo pipefail
+
+readonly SCRIPT_NAME="kvrun-azure"
+readonly SCRIPT_VERSION="0.1.0"
+readonly DEFAULT_SECRET_YEARS=2
+readonly ROLE_NAME="Key Vault Secrets User"
+readonly AZURE_VAULT_NAME_REGEX='^[A-Za-z0-9-]{3,24}$'
+readonly AZURE_SECRET_NAME_REGEX='^[A-Za-z0-9-]{1,127}$'
+readonly MIN_ROLE_ASSIGNMENT_RETRY=10
+
+log_info() {
+    echo "[${SCRIPT_NAME}] $*" >&2
+}
+
+log_error() {
+    echo "[${SCRIPT_NAME}] エラー: $*" >&2
+}
+
+print_version() {
+    echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"
+}
+
+usage() {
+    cat >&2 <<EOF
+使い方: ${SCRIPT_NAME} <コマンドグループ> <サブコマンド> [オプション]
+
+コマンドグループ:
+  app add-client-secret  既存 Entra ID アプリへクライアントシークレットを追加する
+  vault create   Key Vault と kvrun 用サービスプリンシパルを作成する
+  secret add     既存の Key Vault へシークレットを追加する
+
+補足:
+  - 各サブコマンドの詳細は '${SCRIPT_NAME} <コマンドグループ> <サブコマンド> --help' で確認できます
+  - secret add の値は、TTY 接続時は対話入力、非 TTY 時は標準入力から受け取ります
+
+例:
+  ${SCRIPT_NAME} app add-client-secret --app-id 00000000-0000-0000-0000-000000000000
+  ${SCRIPT_NAME} vault create --resource-group my-rg --name my-app-dev-kv
+  ${SCRIPT_NAME} secret add --resource-group my-rg --name my-app-dev-kv --secret-name db-password
+EOF
+}
+
+usage_app() {
+    cat >&2 <<EOF
+使い方: ${SCRIPT_NAME} app <サブコマンド> [オプション]
+
+サブコマンド:
+  add-client-secret   既存 Entra ID アプリへクライアントシークレットを追加する
+EOF
+}
+
+usage_app_add_client_secret() {
+    cat >&2 <<EOF
+使い方: ${SCRIPT_NAME} app add-client-secret --app-id <アプリ ID> [オプション]
+
+概要:
+  既存の Entra ID アプリへ、既存シークレットを消さずに追加のクライアントシークレットを発行します。
+  app_id は 'vault create' の完了出力に表示される値を利用してください。
+
+オプション:
+  --app-id <ID>               対象 Entra ID アプリの appId（必須）
+  --tenant <ID>               ログインコマンドへ表示する tenant ID（未指定時は現在の既定値）
+  --subscription <ID|名前>    対象 subscription（未指定時は現在の既定値）
+  --display-name <表示名>     発行するクライアントシークレットの表示名（既定: kvrun-login）
+  --years <年数>              クライアントシークレットの有効年数（既定: ${DEFAULT_SECRET_YEARS}）
+  -h, --help                  このヘルプを表示する
+
+例:
+  ${SCRIPT_NAME} app add-client-secret --app-id 00000000-0000-0000-0000-000000000000
+  ${SCRIPT_NAME} app add-client-secret --app-id 00000000-0000-0000-0000-000000000000 --display-name teammate-login --years 1
+EOF
+}
+
+usage_vault() {
+    cat >&2 <<EOF
+使い方: ${SCRIPT_NAME} vault <サブコマンド> [オプション]
+
+サブコマンド:
+  create   Key Vault と kvrun 用サービスプリンシパルを作成する
+EOF
+}
+
+usage_vault_create() {
+    cat >&2 <<EOF
+使い方: ${SCRIPT_NAME} vault create --resource-group <リソースグループ名> --name <Key Vault 名> [オプション]
+
+概要:
+  指定した作成先リソースグループが属する subscription / location を使って、
+  kvrun 利用に必要な Key Vault と専用 Entra ID アプリを作成します。
+
+オプション:
+  -g, --resource-group <名前>  作成先リソースグループ名（必須）
+  -n, --name <Key Vault 名>    作成する Key Vault 名（必須）
+  --vault-name <Key Vault 名>  --name の別名
+  --subscription <ID|名前>     対象 subscription（未指定時は現在の既定値）
+  --display-name <表示名>      Entra ID アプリの表示名（既定: kvrun-<vault-name>-sp）
+  --years <年数>               アプリシークレットの有効年数（既定: ${DEFAULT_SECRET_YEARS}）
+  -h, --help                   このヘルプを表示する
+
+例:
+  ${SCRIPT_NAME} vault create --resource-group my-rg --name my-app-dev-kv
+  ${SCRIPT_NAME} vault create --resource-group my-rg --name my-app-dev-kv --subscription 00000000-0000-0000-0000-000000000000
+EOF
+}
+
+usage_secret() {
+    cat >&2 <<EOF
+使い方: ${SCRIPT_NAME} secret <サブコマンド> [オプション]
+
+サブコマンド:
+  add   既存の Key Vault へシークレットを追加する
+EOF
+}
+
+usage_secret_add() {
+    cat >&2 <<EOF
+使い方: ${SCRIPT_NAME} secret add --resource-group <リソースグループ名> --name <Key Vault 名> --secret-name <シークレット名> [オプション]
+
+概要:
+  既存の Azure Key Vault へシークレットを追加します。
+  値は TTY 接続時に非表示で入力し、非 TTY 時は標準入力から受け取ります。
+
+オプション:
+  -g, --resource-group <名前>  対象リソースグループ名（必須）
+  -n, --name <Key Vault 名>    対象 Key Vault 名（必須）
+  --vault-name <Key Vault 名>  --name の別名
+  --secret-name <名前>         追加するシークレット名（必須）
+  --subscription <ID|名前>     対象 subscription（未指定時は現在の既定値）
+  -h, --help                   このヘルプを表示する
+
+例:
+  ${SCRIPT_NAME} secret add --resource-group my-rg --name my-app-dev-kv --secret-name db-password
+  printf 'super-secret\n' | ${SCRIPT_NAME} secret add --resource-group my-rg --name my-app-dev-kv --secret-name db-password
+EOF
+}
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+shell_escape() {
+    printf '%q' "$1"
+}
+
+run_az_tsv() {
+    local output=""
+
+    if ! output="$(az "$@" --output tsv --only-show-errors </dev/null 2>/dev/null)"; then
+        return 1
+    fi
+
+    printf '%s' "${output%$'\r'}"
+}
+
+require_az() {
+    if ! command -v az >/dev/null 2>&1; then
+        log_error "Azure CLI (az) がインストールされていないか、PATH に含まれていません。"
+        log_error "インストール方法: https://learn.microsoft.com/ja-jp/cli/azure/install-azure-cli"
+        exit 1
+    fi
+}
+
+assert_positive_integer() {
+    local value="$1"
+    local label="$2"
+
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "${label} には 1 以上の整数を指定してください。"
+        exit 1
+    fi
+}
+
+issue_app_client_secret() {
+    local app_id="$1"
+    local display_name="$2"
+    local years="$3"
+    local append_mode="${4:-without-append}"
+    local -a az_args=(
+        ad app credential reset
+        --id "$app_id"
+        --display-name "$display_name"
+        --years "$years"
+        --query "password"
+    )
+
+    if [[ "$append_mode" == "append" ]]; then
+        az_args+=(--append)
+    fi
+
+    run_az_tsv "${az_args[@]}"
+}
+
+resolve_resource_group_location() {
+    local resource_group="$1"
+    shift
+    local -a subscription_args=("$@")
+    local location=""
+
+    location="$(run_az_tsv group show \
+        --name "$resource_group" \
+        "${subscription_args[@]}" \
+        --query "location")" || {
+        log_error "リソースグループ情報を取得できませんでした。リソースグループ名とアクセス権限を確認してください。"
+        exit 1
+    }
+
+    printf '%s\n' "$location"
+}
+
+ensure_key_vault_does_not_exist() {
+    local vault_name="$1"
+    local resource_group="$2"
+    local subscription_id="$3"
+
+    if run_az_tsv keyvault show \
+        --name "$vault_name" \
+        --resource-group "$resource_group" \
+        --subscription "$subscription_id" \
+        --query "id" >/dev/null; then
+        log_error "指定した Key Vault は既に存在します: ${vault_name}"
+        exit 1
+    fi
+}
+
+ensure_key_vault_exists() {
+    local vault_name="$1"
+    local resource_group="$2"
+    shift 2
+    local -a subscription_args=("$@")
+    local vault_id=""
+
+    vault_id="$(run_az_tsv keyvault show \
+        --name "$vault_name" \
+        --resource-group "$resource_group" \
+        "${subscription_args[@]}" \
+        --query "id")" || {
+        log_error "対象の Key Vault を取得できませんでした。名前、リソースグループ、アクセス権限を確認してください。"
+        exit 1
+    }
+
+    if [[ -z "$vault_id" ]]; then
+        log_error "対象の Key Vault ID を取得できませんでした。"
+        exit 1
+    fi
+
+    printf '%s\n' "$vault_id"
+}
+
+key_vault_secret_exists() {
+    local vault_name="$1"
+    local secret_name="$2"
+    shift 2
+    local -a subscription_args=("$@")
+
+    if run_az_tsv keyvault secret show \
+        --vault-name "$vault_name" \
+        --name "$secret_name" \
+        "${subscription_args[@]}" \
+        --query "id" >/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+assign_role_with_retry() {
+    local principal_id="$1"
+    local scope="$2"
+    local subscription_id="$3"
+    local attempt=0
+
+    for ((attempt = 1; attempt <= MIN_ROLE_ASSIGNMENT_RETRY; attempt++)); do
+        if az role assignment create \
+            --assignee-object-id "$principal_id" \
+            --assignee-principal-type ServicePrincipal \
+            --role "$ROLE_NAME" \
+            --scope "$scope" \
+            --subscription "$subscription_id" \
+            --only-show-errors \
+            >/dev/null 2>/dev/null </dev/null; then
+            return 0
+        fi
+
+        sleep 2
+    done
+
+    return 1
+}
+
+resolve_subscription_id() {
+    local -a subscription_args=("$@")
+    local subscription_id=""
+
+    subscription_id="$(run_az_tsv account show \
+        "${subscription_args[@]}" \
+        --query "id")" || {
+        log_error "Azure subscription を特定できません。'az account show' で現在の設定を確認してください。"
+        exit 1
+    }
+
+    printf '%s\n' "$subscription_id"
+}
+
+resolve_tenant_id() {
+    local -a subscription_args=("$@")
+    local tenant_id=""
+
+    tenant_id="$(run_az_tsv account show \
+        "${subscription_args[@]}" \
+        --query "tenantId")" || {
+        log_error "Azure CLI のログイン状態を確認できません。'az login' を実行してください。"
+        exit 1
+    }
+
+    printf '%s\n' "$tenant_id"
+}
+
+read_secret_value() {
+    local secret_value=""
+
+    if [[ -t 0 ]]; then
+        if ! IFS= read -r -s -p "追加するシークレット値を入力してください: " secret_value; then
+            printf '\n' >&2
+            log_error "シークレット値の入力に失敗しました。"
+            exit 1
+        fi
+        printf '\n' >&2
+    else
+        if ! IFS= read -r secret_value; then
+            log_error "シークレット値を標準入力から読み取れませんでした。"
+            exit 1
+        fi
+    fi
+
+    if [[ -z "$secret_value" ]]; then
+        log_error "シークレット値が空です。空文字は登録できません。"
+        exit 1
+    fi
+
+    printf '%s' "$secret_value"
+}
+
+build_kv_reference() {
+    local vault_name="$1"
+    local secret_name="$2"
+    local secret_id="$3"
+    local version_id=""
+
+    version_id="${secret_id##*/}"
+    if [[ -z "$version_id" || "$version_id" == "$secret_id" ]]; then
+        log_error "新しいシークレットバージョン ID を取得できませんでした。"
+        exit 1
+    fi
+
+    printf '\n'
+    printf '置換用キー: kv://%s/%s#%s\n' "$vault_name" "$secret_name" "$version_id"
+}
+
+print_app_login_summary() {
+    local app_id="$1"
+    local tenant_id="$2"
+    local subscription_id="$3"
+    local client_secret="$4"
+
+    printf 'App ID: %s\n' "$(shell_escape "$app_id")"
+    printf 'Tenant ID: %s\n' "$(shell_escape "$tenant_id")"
+    printf 'az login --service-principal --username %s --tenant %s && az account set --subscription %s\n' \
+        "$(shell_escape "$app_id")" \
+        "$(shell_escape "$tenant_id")" \
+        "$(shell_escape "$subscription_id")"
+
+    printf '%s\n' "-----"
+    printf 'Password(Secret): %s\n' "$(shell_escape "$client_secret")"
+    printf '%s\n' "-----"
+}
+
+confirm_secret_overwrite() {
+    local vault_name="$1"
+    local secret_name="$2"
+    local answer=""
+
+    if [[ ! -t 0 ]]; then
+        log_error "既存シークレット '${secret_name}' の上書き確認ができません。TTY で再実行してください。"
+        exit 1
+    fi
+
+    printf "シークレット '%s' は Key Vault '%s' に既に存在します。上書きしますか？ [y/N]: " "$secret_name" "$vault_name" >&2
+    if ! IFS= read -r answer; then
+        printf '\n' >&2
+        log_error "上書き確認の入力に失敗しました。"
+        exit 1
+    fi
+
+    case "$answer" in
+        y|Y|yes|YES)
+            return 0
+            ;;
+        *)
+            log_info "シークレット追加を中止しました。"
+            exit 1
+            ;;
+    esac
+}
+
+command_vault_create() {
+    local resource_group=""
+    local vault_name=""
+    local subscription_name=""
+    local app_display_name=""
+    local secret_years="$DEFAULT_SECRET_YEARS"
+    local tenant_id=""
+    local subscription_id=""
+    local location=""
+    local vault_id=""
+    local app_id=""
+    local client_secret=""
+    local sp_object_id=""
+    local -a positional_args=()
+    local -a subscription_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -g|--resource-group)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--resource-group には作成先リソースグループ名を指定してください。"
+                    exit 1
+                fi
+                resource_group="$2"
+                shift 2
+                ;;
+            -n|--name|--vault-name)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--name には Key Vault 名を指定してください。"
+                    exit 1
+                fi
+                vault_name="$2"
+                shift 2
+                ;;
+            --subscription)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--subscription には subscription ID または名前を指定してください。"
+                    exit 1
+                fi
+                subscription_name="$2"
+                shift 2
+                ;;
+            --display-name|--app-name)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--display-name には表示名を指定してください。"
+                    exit 1
+                fi
+                app_display_name="$2"
+                shift 2
+                ;;
+            --years|--secret-years)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--years には年数を指定してください。"
+                    exit 1
+                fi
+                secret_years="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage_vault_create
+                exit 0
+                ;;
+            -*)
+                log_error "不明なオプション: $1"
+                usage_vault_create
+                exit 1
+                ;;
+            *)
+                positional_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$resource_group" && ${#positional_args[@]} -ge 1 ]]; then
+        resource_group="${positional_args[0]}"
+    fi
+
+    if [[ -z "$vault_name" && ${#positional_args[@]} -ge 2 ]]; then
+        vault_name="${positional_args[1]}"
+    fi
+
+    if [[ ${#positional_args[@]} -gt 2 ]]; then
+        log_error "指定できる位置引数はリソースグループ名と Key Vault 名までです。"
+        usage_vault_create
+        exit 1
+    fi
+
+    if [[ -z "$resource_group" || -z "$vault_name" ]]; then
+        log_error "--resource-group と --name を指定してください。"
+        usage_vault_create
+        exit 1
+    fi
+
+    resource_group="$(trim "$resource_group")"
+    vault_name="$(trim "$vault_name")"
+
+    if [[ ! "$vault_name" =~ $AZURE_VAULT_NAME_REGEX ]]; then
+        log_error "Key Vault 名の形式が不正です: ${vault_name}"
+        log_error "許可形式: 英数字とハイフンのみ、3 文字以上 24 文字以下"
+        exit 1
+    fi
+
+    assert_positive_integer "$secret_years" "--years"
+    require_az
+
+    if [[ -n "$subscription_name" ]]; then
+        subscription_args=(--subscription "$subscription_name")
+    fi
+
+    if [[ -z "$app_display_name" ]]; then
+        app_display_name="kvrun-${vault_name}-sp"
+    fi
+
+    tenant_id="$(resolve_tenant_id "${subscription_args[@]}")"
+    subscription_id="$(resolve_subscription_id "${subscription_args[@]}")"
+    location="$(resolve_resource_group_location "$resource_group" "${subscription_args[@]}")"
+
+    if [[ -z "$location" ]]; then
+        log_error "リソースグループの location を特定できませんでした。"
+        exit 1
+    fi
+
+    ensure_key_vault_does_not_exist "$vault_name" "$resource_group" "$subscription_id"
+
+    log_info "Key Vault を作成します: subscription=${subscription_id}, resourceGroup=${resource_group}, location=${location}"
+    vault_id="$(run_az_tsv keyvault create \
+        --name "$vault_name" \
+        --resource-group "$resource_group" \
+        --location "$location" \
+        --enable-rbac-authorization true \
+        --subscription "$subscription_id" \
+        --query "id")" || {
+        log_error "Key Vault の作成に失敗しました。名前重複やアクセス権限を確認してください。"
+        exit 1
+    }
+
+    log_info "Entra ID アプリを作成します: ${app_display_name}"
+    app_id="$(run_az_tsv ad app create \
+        --display-name "$app_display_name" \
+        --sign-in-audience AzureADMyOrg \
+        --query "appId")" || {
+        log_error "Entra ID アプリの作成に失敗しました。ディレクトリ権限を確認してください。"
+        exit 1
+    }
+
+    client_secret="$(issue_app_client_secret "$app_id" "kvrun-login" "$secret_years")" || {
+        log_error "Entra ID アプリのシークレット発行に失敗しました。"
+        exit 1
+    }
+
+    if [[ -z "$client_secret" ]]; then
+        log_error "Entra ID アプリのシークレットを取得できませんでした。"
+        exit 1
+    fi
+
+    sp_object_id="$(run_az_tsv ad sp create \
+        --id "$app_id" \
+        --query "id")" || {
+        log_error "サービスプリンシパルの作成に失敗しました。"
+        exit 1
+    }
+
+    if [[ -z "$sp_object_id" ]]; then
+        log_error "サービスプリンシパル ID を取得できませんでした。"
+        exit 1
+    fi
+
+    log_info "Key Vault へ '${ROLE_NAME}' ロールを付与します。"
+    if ! assign_role_with_retry "$sp_object_id" "$vault_id" "$subscription_id"; then
+        log_error "Key Vault のロール割り当てに失敗しました。Entra ID 反映待ちの可能性があります。しばらく待ってから再実行してください。"
+        exit 1
+    fi
+
+    log_info "Key Vault 作成完了: ${vault_id}"
+    log_info "Entra ID アプリ作成完了: ${app_display_name} (${app_id})"
+    log_info "以下のコマンドでサービスプリンシパルとしてログインできます。シークレットはこの出力のみで確認してください。"
+    print_app_login_summary "$app_id" "$tenant_id" "$subscription_id" "$client_secret"
+}
+
+command_app_add_client_secret() {
+    local app_id=""
+    local tenant_id=""
+    local subscription_name=""
+    local subscription_id=""
+    local app_secret_display_name="kvrun-login"
+    local secret_years="$DEFAULT_SECRET_YEARS"
+    local client_secret=""
+    local -a subscription_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --app-id)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--app-id には対象 Entra ID アプリの appId を指定してください。"
+                    exit 1
+                fi
+                app_id="$2"
+                shift 2
+                ;;
+            --tenant)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--tenant には tenant ID を指定してください。"
+                    exit 1
+                fi
+                tenant_id="$2"
+                shift 2
+                ;;
+            --subscription)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--subscription には subscription ID または名前を指定してください。"
+                    exit 1
+                fi
+                subscription_name="$2"
+                shift 2
+                ;;
+            --display-name)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--display-name には表示名を指定してください。"
+                    exit 1
+                fi
+                app_secret_display_name="$2"
+                shift 2
+                ;;
+            --years)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--years には年数を指定してください。"
+                    exit 1
+                fi
+                secret_years="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage_app_add_client_secret
+                exit 0
+                ;;
+            -*)
+                log_error "不明なオプション: $1"
+                usage_app_add_client_secret
+                exit 1
+                ;;
+            *)
+                log_error "不明な引数です: $1"
+                usage_app_add_client_secret
+                exit 1
+                ;;
+        esac
+    done
+
+    app_id="$(trim "$app_id")"
+    tenant_id="$(trim "$tenant_id")"
+    app_secret_display_name="$(trim "$app_secret_display_name")"
+
+    if [[ -z "$app_id" ]]; then
+        log_error "--app-id を指定してください。"
+        usage_app_add_client_secret
+        exit 1
+    fi
+
+    if [[ -z "$app_secret_display_name" ]]; then
+        log_error "--display-name は空にできません。"
+        exit 1
+    fi
+
+    assert_positive_integer "$secret_years" "--years"
+    require_az
+
+    if [[ -n "$subscription_name" ]]; then
+        subscription_args=(--subscription "$subscription_name")
+    fi
+
+    subscription_id="$(resolve_subscription_id "${subscription_args[@]}")"
+    if [[ -z "$tenant_id" ]]; then
+        tenant_id="$(resolve_tenant_id "${subscription_args[@]}")"
+    fi
+
+    log_info "Entra ID アプリへクライアントシークレットを追加します: appId=${app_id}"
+    client_secret="$(issue_app_client_secret "$app_id" "$app_secret_display_name" "$secret_years" "append")" || {
+        log_error "Entra ID アプリの追加シークレット発行に失敗しました。appId とディレクトリ権限を確認してください。"
+        exit 1
+    }
+
+    if [[ -z "$client_secret" ]]; then
+        log_error "Entra ID アプリの追加シークレットを取得できませんでした。"
+        exit 1
+    fi
+
+    log_info "追加シークレット発行完了: ${app_id}"
+    log_info "以下のコマンドでサービスプリンシパルとしてログインできます。シークレットはこの出力のみで確認してください。"
+    print_app_login_summary "$app_id" "$tenant_id" "$subscription_id" "$client_secret"
+}
+
+command_secret_add() {
+    local resource_group=""
+    local vault_name=""
+    local secret_name=""
+    local subscription_name=""
+    local subscription_id=""
+    local vault_id=""
+    local secret_value=""
+    local secret_id=""
+    local -a subscription_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -g|--resource-group)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--resource-group には対象リソースグループ名を指定してください。"
+                    exit 1
+                fi
+                resource_group="$2"
+                shift 2
+                ;;
+            -n|--name|--vault-name)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--name には対象 Key Vault 名を指定してください。"
+                    exit 1
+                fi
+                vault_name="$2"
+                shift 2
+                ;;
+            --secret-name)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--secret-name には追加するシークレット名を指定してください。"
+                    exit 1
+                fi
+                secret_name="$2"
+                shift 2
+                ;;
+            --subscription)
+                if [[ $# -lt 2 ]]; then
+                    log_error "--subscription には subscription ID または名前を指定してください。"
+                    exit 1
+                fi
+                subscription_name="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage_secret_add
+                exit 0
+                ;;
+            -*)
+                log_error "不明なオプション: $1"
+                usage_secret_add
+                exit 1
+                ;;
+            *)
+                log_error "不明な引数です: $1"
+                usage_secret_add
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ -z "$resource_group" || -z "$vault_name" || -z "$secret_name" ]]; then
+        log_error "--resource-group と --name と --secret-name を指定してください。"
+        usage_secret_add
+        exit 1
+    fi
+
+    resource_group="$(trim "$resource_group")"
+    vault_name="$(trim "$vault_name")"
+    secret_name="$(trim "$secret_name")"
+
+    if [[ ! "$vault_name" =~ $AZURE_VAULT_NAME_REGEX ]]; then
+        log_error "Key Vault 名の形式が不正です: ${vault_name}"
+        log_error "許可形式: 英数字とハイフンのみ、3 文字以上 24 文字以下"
+        exit 1
+    fi
+
+    if [[ ! "$secret_name" =~ $AZURE_SECRET_NAME_REGEX ]]; then
+        log_error "シークレット名の形式が不正です: ${secret_name}"
+        log_error "許可形式: 英数字とハイフンのみ、1 文字以上 127 文字以下"
+        exit 1
+    fi
+
+    require_az
+
+    if [[ -n "$subscription_name" ]]; then
+        subscription_args=(--subscription "$subscription_name")
+    fi
+
+    subscription_id="$(resolve_subscription_id "${subscription_args[@]}")"
+    vault_id="$(ensure_key_vault_exists "$vault_name" "$resource_group" "${subscription_args[@]}")"
+
+    if key_vault_secret_exists "$vault_name" "$secret_name" "${subscription_args[@]}"; then
+        confirm_secret_overwrite "$vault_name" "$secret_name"
+    fi
+
+    secret_value="$(read_secret_value)"
+
+    log_info "Key Vault へシークレットを追加します: vault=${vault_name}, secret=${secret_name}"
+    secret_id="$(run_az_tsv keyvault secret set \
+        --vault-name "$vault_name" \
+        --name "$secret_name" \
+        --value "$secret_value" \
+        --subscription "$subscription_id" \
+        --query "id")" || {
+        log_error "シークレットの追加に失敗しました。アクセス権限と Key Vault の状態を確認してください。"
+        exit 1
+    }
+
+    if [[ -z "$secret_id" ]]; then
+        log_error "シークレット ID を取得できませんでした。"
+        exit 1
+    fi
+
+    log_info "Key Vault の確認完了: ${vault_id}"
+    log_info "シークレット追加完了: vault=${vault_name}, secret=${secret_name}"
+    printf '%s\n' "$(build_kv_reference "$vault_name" "$secret_name" "$secret_id")"
+}
+
+dispatch_vault() {
+    if [[ $# -eq 0 ]]; then
+        usage_vault
+        exit 1
+    fi
+
+    case "$1" in
+        create)
+            shift
+            command_vault_create "$@"
+            ;;
+        -h|--help)
+            usage_vault
+            ;;
+        *)
+            log_error "不明な vault サブコマンド: $1"
+            usage_vault
+            exit 1
+            ;;
+    esac
+}
+
+dispatch_app() {
+    if [[ $# -eq 0 ]]; then
+        usage_app
+        exit 1
+    fi
+
+    case "$1" in
+        add-client-secret)
+            shift
+            command_app_add_client_secret "$@"
+            ;;
+        -h|--help)
+            usage_app
+            ;;
+        *)
+            log_error "不明な app サブコマンド: $1"
+            usage_app
+            exit 1
+            ;;
+    esac
+}
+
+dispatch_secret() {
+    if [[ $# -eq 0 ]]; then
+        usage_secret
+        exit 1
+    fi
+
+    case "$1" in
+        add)
+            shift
+            command_secret_add "$@"
+            ;;
+        -h|--help)
+            usage_secret
+            ;;
+        *)
+            log_error "不明な secret サブコマンド: $1"
+            usage_secret
+            exit 1
+            ;;
+    esac
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        -v|--version)
+            print_version
+            ;;
+        app)
+            shift
+            dispatch_app "$@"
+            ;;
+        vault)
+            shift
+            dispatch_vault "$@"
+            ;;
+        secret)
+            shift
+            dispatch_secret "$@"
+            ;;
+        *)
+            log_error "不明なコマンドグループ: $1"
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
